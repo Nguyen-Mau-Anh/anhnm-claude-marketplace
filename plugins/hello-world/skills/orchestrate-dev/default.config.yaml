@@ -1,0 +1,134 @@
+# Orchestrate Dev - Layer 1 Configuration
+# =========================================
+# This file is auto-copied to docs/orchestrate-dev.config.yaml on first run.
+# Customize the copy in docs/ folder for your project.
+#
+# Execution Model: HYBRID
+# - BMAD workflows: Spawned as separate agents (isolated context)
+# - Bash commands: Direct execution (shared context)
+# - Orchestration: Parent context (coordination)
+
+name: orchestrate-dev
+version: "1.0.0"
+description: "Layer 1: Story development with quality checks"
+layer: 1
+
+# Story file locations to check (in order)
+story_locations:
+  - "state/stories/${story_id}.md"
+  - "docs/stories/${story_id}.md"
+  - "docs/sprint-artifacts/${story_id}.md"
+
+# All stages are MANDATORY
+# Execution types:
+#   - spawn: Run as separate agent via Task tool (for BMAD workflows)
+#   - direct: Run directly in parent context (for bash commands)
+
+stages:
+  # Stage 1: Create story if file doesn't exist
+  create-story:
+    order: 1
+    enabled: true
+    execution: spawn
+    type: bmad_workflow
+    workflow: /bmad:bmm:workflows:create-story
+    condition: story_file_not_exists
+    timeout: 300
+    on_failure: abort
+    description: "Create story file from epics if it doesn't exist"
+
+  # Stage 2: Validate story is ready for development
+  validate:
+    order: 2
+    enabled: true
+    execution: spawn
+    type: bmad_workflow
+    workflow: /bmad:bmm:workflows:implementation-readiness
+    timeout: 180
+    on_failure: fix_and_retry
+    retry:
+      max: 2
+      fix_prompt: "Fix the validation issues identified above"
+    description: "Validate story has clear tasks and acceptance criteria"
+
+  # Stage 3: Develop the story
+  develop:
+    order: 3
+    enabled: true
+    execution: spawn
+    type: bmad_workflow
+    workflow: /bmad:bmm:workflows:dev-story
+    timeout: 900
+    on_failure: fix_and_retry
+    retry:
+      max: 3
+      fix_prompt: "Continue development, addressing any issues"
+    description: "Implement the story following tasks in story file"
+
+  # Stage 4: Run linting (direct - lightweight)
+  lint:
+    order: 4
+    enabled: true
+    execution: direct
+    type: bash
+    command: "npm run lint"
+    timeout: 120
+    on_failure: fix_and_retry
+    retry:
+      max: 2
+      fix_agent: /bmad:bmm:agents:dev
+      fix_prompt: "Fix the lint errors shown above"
+    description: "Check code style and formatting"
+
+  # Stage 5: Run type checking (direct - lightweight)
+  typecheck:
+    order: 5
+    enabled: true
+    execution: direct
+    type: bash
+    command: "npm run typecheck"
+    timeout: 180
+    on_failure: fix_and_retry
+    retry:
+      max: 2
+      fix_agent: /bmad:bmm:agents:dev
+      fix_prompt: "Fix the TypeScript type errors shown above"
+    description: "Check TypeScript types"
+
+  # Stage 6: Run unit tests (direct - lightweight)
+  unit-test:
+    order: 6
+    enabled: true
+    execution: direct
+    type: bash
+    command: "npm test"
+    timeout: 300
+    on_failure: fix_and_retry
+    retry:
+      max: 3
+      fix_agent: /bmad:bmm:agents:dev
+      fix_prompt: "Fix the failing tests shown above"
+    description: "Run all unit tests"
+
+  # Stage 7: Code review (spawn - heavy workflow)
+  code-review:
+    order: 7
+    enabled: true
+    execution: spawn
+    type: bmad_workflow
+    workflow: /bmad:bmm:workflows:code-review
+    timeout: 300
+    on_failure: continue
+    blocking: false
+    description: "Review code quality, security, and architecture"
+
+# Output variables captured from execution
+output:
+  - story_id
+  - story_file
+  - files_changed
+  - lint_result
+  - typecheck_result
+  - test_results
+  - review_findings
+  - status
