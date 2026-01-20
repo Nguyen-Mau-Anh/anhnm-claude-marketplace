@@ -1,0 +1,10 @@
+{
+  "hooks": [
+    {
+      "name": "session-welcome",
+      "event": "SessionStart",
+      "description": "Displays a welcome message when a new Claude Code session starts",
+      "command": "echo '👋 Welcome to Claude Code! Type /help for available commands.'"
+    }
+  ]
+}

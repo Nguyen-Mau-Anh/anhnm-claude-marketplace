@@ -1,0 +1,19 @@
+{
+  "name": "anhnm-claude-marketplace",
+  "owner": {
+    "name": "anhnm",
+    "email": "your-email@example.com"
+  },
+  "metadata": {
+    "description": "Personal Claude Code marketplace with custom skills, hooks, and MCP servers",
+    "version": "1.0.0",
+    "repository": "https://github.com/anhnm/anhnm-claude-marketplace"
+  },
+  "plugins": [
+    {
+      "name": "hello-world",
+      "path": "plugins/hello-world",
+      "description": "Example plugin demonstrating skills, hooks, commands, and agents"
+    }
+  ]
+}

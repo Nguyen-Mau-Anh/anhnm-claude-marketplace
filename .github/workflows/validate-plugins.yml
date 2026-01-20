@@ -1,0 +1,56 @@
+name: Validate Plugins
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate marketplace.json
+        run: |
+          if [ ! -f ".claude-plugin/marketplace.json" ]; then
+            echo "Error: marketplace.json not found"
+            exit 1
+          fi
+          echo "marketplace.json exists"
+          cat .claude-plugin/marketplace.json | python3 -m json.tool > /dev/null
+          echo "marketplace.json is valid JSON"
+
+      - name: Validate plugin structure
+        run: |
+          for plugin_dir in plugins/*/; do
+            plugin_name=$(basename "$plugin_dir")
+            echo "Validating plugin: $plugin_name"
+
+            # Check plugin.json exists
+            if [ ! -f "${plugin_dir}.claude-plugin/plugin.json" ]; then
+              echo "Error: ${plugin_dir}.claude-plugin/plugin.json not found"
+              exit 1
+            fi
+
+            # Validate plugin.json is valid JSON
+            cat "${plugin_dir}.claude-plugin/plugin.json" | python3 -m json.tool > /dev/null
+            echo "  - plugin.json is valid"
+
+            # Check for README
+            if [ -f "${plugin_dir}README.md" ]; then
+              echo "  - README.md exists"
+            else
+              echo "  - Warning: README.md not found"
+            fi
+
+            echo "  Plugin $plugin_name validated successfully"
+          done
+
+      - name: Check for required files
+        run: |
+          echo "Checking repository structure..."
+          [ -f "README.md" ] && echo "  - README.md exists" || echo "  - Warning: README.md not found"
+          [ -f ".gitignore" ] && echo "  - .gitignore exists" || echo "  - Warning: .gitignore not found"
+          echo "Validation complete!"

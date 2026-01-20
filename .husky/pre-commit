@@ -1,0 +1,11 @@
+#!/bin/sh
+
+echo "🔍 Running pre-commit validations..."
+
+# Run lint-staged for staged files
+npx lint-staged
+
+# Run full validation
+npm run validate
+
+echo "✅ Pre-commit checks passed!"

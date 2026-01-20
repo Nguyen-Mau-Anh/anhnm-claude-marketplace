@@ -1,0 +1,34 @@
+{
+  "name": "anhnm-claude-marketplace",
+  "version": "1.0.0",
+  "description": "Personal Claude Code plugin marketplace with custom skills, hooks, and MCP servers",
+  "author": "anhnm",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "validate": "node scripts/validate.js",
+    "validate:marketplace": "node scripts/validate.js --marketplace-only",
+    "validate:plugins": "node scripts/validate.js --plugins-only",
+    "lint:json": "node scripts/lint-json.js",
+    "version:list": "node scripts/version.js list",
+    "version:bump": "node scripts/version.js bump",
+    "version:interactive": "node scripts/version.js -i",
+    "new-plugin": "node scripts/new-plugin.js",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "lint-staged": "^15.2.11"
+  },
+  "lint-staged": {
+    "*.json": [
+      "node scripts/lint-json.js"
+    ],
+    "plugins/**/*": [
+      "node scripts/validate.js --staged"
+    ]
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

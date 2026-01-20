@@ -1,0 +1,28 @@
+#!/bin/sh
+
+# Validate commit message format
+# Enforces conventional commits: type(scope): description
+
+commit_msg_file=$1
+commit_msg=$(cat "$commit_msg_file")
+
+# Pattern for conventional commits
+pattern="^(feat|fix|docs|style|refactor|test|chore|perf|ci|build|revert)(\(.+\))?: .{1,}"
+
+if ! echo "$commit_msg" | grep -qE "$pattern"; then
+  echo "❌ Invalid commit message format!"
+  echo ""
+  echo "Commit message must follow Conventional Commits format:"
+  echo "  <type>(<scope>): <description>"
+  echo ""
+  echo "Types: feat, fix, docs, style, refactor, test, chore, perf, ci, build, revert"
+  echo ""
+  echo "Examples:"
+  echo "  feat(plugin): add new code-review plugin"
+  echo "  fix(hooks): resolve session start timing issue"
+  echo "  docs: update README with installation instructions"
+  echo ""
+  exit 1
+fi
+
+echo "✅ Commit message format valid"

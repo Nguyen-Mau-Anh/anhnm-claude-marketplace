@@ -1,0 +1,28 @@
+{
+  "name": "hello-world",
+  "version": "1.0.1",
+  "description": "Example plugin demonstrating Claude Code plugin components",
+  "author": {
+    "name": "anhnm"
+  },
+  "license": "MIT",
+  "keywords": [
+    "example",
+    "starter",
+    "template"
+  ],
+  "components": {
+    "commands": [
+      "greet"
+    ],
+    "skills": [
+      "greeting-assistant"
+    ],
+    "hooks": [
+      "session-welcome"
+    ],
+    "agents": [
+      "greeter"
+    ]
+  }
+}
