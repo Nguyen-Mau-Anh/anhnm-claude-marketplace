@@ -7,11 +7,25 @@
 # - BMAD workflows: Spawned as separate agents (isolated context)
 # - Bash commands: Direct execution (shared context)
 # - Orchestration: Parent context (coordination)
+#
+# Prompt Variables (for spawn stages):
+#   {story_id}      - The story identifier
+#   {story_file}    - Path to story file
+#   {errors}        - Error output from failed command (for fix stages)
+#   {files_changed} - List of changed files (for code review)
+#   {autonomy}      - Auto-injected autonomy instructions
 
 name: orchestrate-dev
 version: "1.0.0"
 description: "Layer 1: Story development with quality checks"
 layer: 1
+
+# Autonomy instructions injected into all prompts
+autonomy_instructions: |
+  AUTONOMOUS MODE - NO QUESTIONS.
+  Skip all menus, confirmations, and user prompts.
+  Execute the task completely and output results only.
+  Do not ask follow-up questions.
 
 # Story file locations to check (in order)
 story_locations:
@@ -36,6 +50,12 @@ stages:
     timeout: 300
     on_failure: abort
     description: "Create story file from epics if it doesn't exist"
+    prompt: |
+      /bmad:bmm:workflows:create-story
+      {autonomy}
+      Create the next story from the epics/backlog.
+      Read the epics file and generate the story file.
+      Output: story_id and story_file path.
 
   # Stage 2: Validate story is ready for development
   validate:
@@ -50,6 +70,18 @@ stages:
       max: 2
       fix_prompt: "Fix the validation issues identified above"
     description: "Validate story has clear tasks and acceptance criteria"
+    prompt: |
+      /bmad:bmm:workflows:implementation-readiness
+      {autonomy}
+      Validate story is ready for development.
+      Story file: {story_file}
+
+      Check:
+      - Clear acceptance criteria
+      - Well-defined tasks
+      - Dependencies documented
+
+      Output: PASS or FAIL with details.
 
   # Stage 3: Develop the story
   develop:
@@ -64,6 +96,15 @@ stages:
       max: 3
       fix_prompt: "Continue development, addressing any issues"
     description: "Implement the story following tasks in story file"
+    prompt: |
+      /bmad:bmm:workflows:dev-story
+      {autonomy}
+      Implement the story following tasks in the story file.
+      Story file: {story_file}
+      Story ID: {story_id}
+
+      Follow red-green-refactor cycle for each task.
+      Output: List of files changed and implementation summary.
 
   # Stage 4: Run linting (direct - lightweight)
   lint:
@@ -79,6 +120,15 @@ stages:
       fix_agent: /bmad:bmm:agents:dev
       fix_prompt: "Fix the lint errors shown above"
     description: "Check code style and formatting"
+    prompt: |
+      /bmad:bmm:agents:dev
+      {autonomy}
+      Fix the following lint errors:
+
+      {errors}
+
+      Apply fixes and ensure code passes linting.
+      Output: Summary of fixes applied.
 
   # Stage 5: Run type checking (direct - lightweight)
   typecheck:
@@ -94,6 +144,15 @@ stages:
       fix_agent: /bmad:bmm:agents:dev
       fix_prompt: "Fix the TypeScript type errors shown above"
     description: "Check TypeScript types"
+    prompt: |
+      /bmad:bmm:agents:dev
+      {autonomy}
+      Fix the following TypeScript type errors:
+
+      {errors}
+
+      Apply fixes and ensure code passes type checking.
+      Output: Summary of fixes applied.
 
   # Stage 6: Run unit tests (direct - lightweight)
   unit-test:
@@ -109,6 +168,15 @@ stages:
       fix_agent: /bmad:bmm:agents:dev
       fix_prompt: "Fix the failing tests shown above"
     description: "Run all unit tests"
+    prompt: |
+      /bmad:bmm:agents:dev
+      {autonomy}
+      Fix the following failing tests:
+
+      {errors}
+
+      Fix either the tests or the implementation as appropriate.
+      Output: Summary of fixes applied.
 
   # Stage 7: Code review (spawn - heavy workflow)
   code-review:
@@ -121,6 +189,19 @@ stages:
     on_failure: continue
     blocking: false
     description: "Review code quality, security, and architecture"
+    prompt: |
+      /bmad:bmm:workflows:code-review
+      {autonomy}
+      Review the implemented code for story {story_id}.
+      Files changed: {files_changed}
+
+      Review for:
+      - Code quality
+      - Security issues
+      - Performance
+      - Architecture compliance
+
+      Output: Findings with severity levels.
 
 # Output variables captured from execution
 output:

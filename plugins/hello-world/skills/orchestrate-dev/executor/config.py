@@ -3,7 +3,7 @@
 import yaml
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List
 from pydantic import BaseModel, Field
 
 
@@ -16,10 +16,10 @@ class RetryConfig(BaseModel):
 
 class StageConfig(BaseModel):
     """Configuration for a single stage."""
-    order: int
+    order: int = 0  # Made optional with default
     enabled: bool = True
     execution: str = "spawn"  # "spawn" or "direct"
-    type: str  # "bmad_workflow" or "bash"
+    type: str = "bmad_workflow"  # "bmad_workflow" or "bash"
     workflow: Optional[str] = None
     command: Optional[str] = None
     condition: Optional[str] = None
@@ -28,6 +28,8 @@ class StageConfig(BaseModel):
     retry: Optional[RetryConfig] = None
     blocking: bool = True
     description: Optional[str] = None
+    # Prompt template for spawn stages - supports {story_id}, {story_file}, {errors}, {files_changed}
+    prompt: Optional[str] = None
 
 
 class DevConfig(BaseModel):
@@ -37,15 +39,21 @@ class DevConfig(BaseModel):
     description: str = "Story development with quality checks"
     layer: int = 1
 
-    story_locations: list[str] = Field(default_factory=lambda: [
+    # Autonomy instructions injected into all prompts via {autonomy}
+    autonomy_instructions: str = """AUTONOMOUS MODE - NO QUESTIONS.
+Skip all menus, confirmations, and user prompts.
+Execute the task completely and output results only.
+Do not ask follow-up questions."""
+
+    story_locations: List[str] = Field(default_factory=lambda: [
         "state/stories/${story_id}.md",
         "docs/stories/${story_id}.md",
         "docs/sprint-artifacts/${story_id}.md",
     ])
 
-    stages: dict[str, StageConfig] = Field(default_factory=dict)
+    stages: Dict[str, StageConfig] = Field(default_factory=dict)
 
-    output: list[str] = Field(default_factory=lambda: [
+    output: List[str] = Field(default_factory=lambda: [
         "story_id", "story_file", "files_changed",
         "lint_result", "typecheck_result", "test_results",
         "review_findings", "status"
@@ -102,6 +110,7 @@ class ConfigLoader:
             version=data.get("version", "1.0.0"),
             description=data.get("description", ""),
             layer=data.get("layer", 1),
+            autonomy_instructions=data.get("autonomy_instructions", DevConfig.model_fields["autonomy_instructions"].default),
             story_locations=data.get("story_locations", []),
             stages=stages,
             output=data.get("output", []),

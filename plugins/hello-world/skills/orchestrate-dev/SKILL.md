@@ -8,30 +8,27 @@ allowed-tools: Bash, Read, Write, Glob
 
 Automated story development pipeline with quality gates.
 
-## Execution Model
-
-- **BMAD workflows** → Spawned as separate `claude --print` processes (fully isolated)
-- **Bash commands** → Direct execution (lint, typecheck, test)
-- **Fix-and-retry** → Spawns dev agent to fix failures
-
 ## Commands
 
 | User Says | Action |
 |-----------|--------|
 | `/orchestrate-dev` | Run next story from backlog |
-| `/orchestrate-dev 1-2-user-auth` | Develop specific story |
+| `/orchestrate-dev <story_id>` | Develop specific story (e.g., `1-2-user-auth`) |
 
 ## Execution
 
-**IMPORTANT: Before running, ensure dependencies are installed.**
+**CRITICAL: You MUST run the Python executor via bash. Do NOT try to execute the pipeline steps manually.**
 
-### Step 1: Install Dependencies
+### Step 1: Install Dependencies (REQUIRED)
 
+Run this BEFORE any orchestrator command:
 ```bash
 pip install -q -r "${PWD}/.claude/skills/orchestrate-dev/requirements.txt" 2>/dev/null || pip install rich typer pydantic pyyaml
 ```
 
-### Step 2: Run Pipeline
+### Step 2: Run the Executor
+
+The executor spawns Claude agents via `claude --print` for each pipeline stage.
 
 ```bash
 PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor
@@ -42,7 +39,24 @@ PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor
 | Command | Full Execution |
 |---------|----------------|
 | `/orchestrate-dev` | `PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor` |
-| `/orchestrate-dev {story_id}` | `PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor {story_id}` |
+| `/orchestrate-dev <story_id>` | `PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor <story_id>` |
+
+**Example:**
+```bash
+# Run next story from backlog
+PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor
+
+# Run specific story
+PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor 1-2-user-auth
+```
+
+## How It Works
+
+The Python executor manages the pipeline by spawning isolated Claude agents:
+
+1. **SPAWN stages** → Runs `claude --print -p "<prompt>"` as subprocess
+2. **DIRECT stages** → Runs bash commands directly (lint, typecheck, test)
+3. **Fix-and-retry** → On failure, spawns dev agent to fix, then retries
 
 ## Configuration
 

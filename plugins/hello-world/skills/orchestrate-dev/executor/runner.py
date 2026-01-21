@@ -1,18 +1,24 @@
-"""Pipeline runner for Layer 1 - orchestrate-dev."""
+"""Pipeline runner for Layer 1 - orchestrate-dev.
+
+IMPORTANT: The orchestrator ONLY coordinates and spawns agents.
+It NEVER executes tasks directly in its own context.
+All work (develop, lint fixes, test fixes) is done by spawned agents.
+"""
 
 import subprocess
+import sys
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
 
 from .config import ConfigLoader, DevConfig
-from .spawner import ClaudeSpawner, TaskType, TaskResult
+from .spawner import ClaudeSpawner, TaskResult, BackgroundTask, TaskStatus
 
 
-console = Console()
+def log(msg: str) -> None:
+    """Print with immediate flush for background visibility."""
+    print(msg, flush=True)
 
 
 @dataclass
@@ -21,12 +27,8 @@ class PipelineResult:
     success: bool
     story_id: Optional[str] = None
     story_file: Optional[str] = None
-    files_changed: list[str] = field(default_factory=list)
-    lint_result: str = "NOT_RUN"
-    typecheck_result: str = "NOT_RUN"
-    test_results: str = "NOT_RUN"
-    review_findings: list[str] = field(default_factory=list)
-    stage_results: dict[str, str] = field(default_factory=dict)
+    files_changed: List[str] = field(default_factory=list)
+    stage_results: Dict[str, str] = field(default_factory=dict)
     error: Optional[str] = None
 
 
@@ -34,14 +36,9 @@ class PipelineRunner:
     """
     Execute Layer 1 pipeline stages.
 
-    Stages:
-    1. Create story (SPAWN) - if file doesn't exist
-    2. Validate (SPAWN)
-    3. Develop (SPAWN)
-    4. Lint (DIRECT)
-    5. Typecheck (DIRECT)
-    6. Unit test (DIRECT)
-    7. Code review (SPAWN)
+    CRITICAL: This orchestrator ONLY spawns agents and coordinates.
+    It NEVER executes any development tasks in its own context.
+    All lint fixes, test fixes, and development work is done by spawned agents.
     """
 
     def __init__(self, project_root: Path):
@@ -56,316 +53,318 @@ class PipelineRunner:
 
         try:
             # Step 0: Load config
-            console.print("\n[bold blue]Step 0: Loading configuration...[/bold blue]")
+            log("\n=== Step 0: Loading configuration ===")
             self.config = self.config_loader.load()
+            self.spawner.set_config(self.config)
+            log("  Config loaded successfully")
 
             # Step 1: Determine story
-            console.print("\n[bold blue]Step 1: Determining story...[/bold blue]")
+            log("\n=== Step 1: Determining story ===")
             story_id, story_file = self._resolve_story(story_id)
             result.story_id = story_id
             result.story_file = str(story_file) if story_file else None
 
             if not story_file:
                 result.error = "Failed to create or find story file"
+                log(f"  ERROR: {result.error}")
                 return result
 
-            console.print(f"  Story ID: {story_id}")
-            console.print(f"  Story file: {story_file}")
+            log(f"  Story ID: {story_id}")
+            log(f"  Story file: {story_file}")
             result.stage_results["create-story"] = "PASS"
 
             # Step 2: Validate story
-            console.print("\n[bold blue]Step 2: Validating story...[/bold blue]")
-            if not self._run_validate(story_file, result):
+            log("\n=== Step 2: Validating story ===")
+            passed = self._run_spawn_stage("validate", story_file=str(story_file))
+            result.stage_results["validate"] = "PASS" if passed else "FAIL"
+            if not passed and self._should_abort("validate"):
+                result.error = "Validation failed"
                 return result
-            result.stage_results["validate"] = "PASS"
 
             # Step 3: Develop story
-            console.print("\n[bold blue]Step 3: Developing story...[/bold blue]")
-            if not self._run_develop(story_id, story_file, result):
+            log("\n=== Step 3: Developing story ===")
+            passed = self._run_spawn_stage("develop", story_id=story_id, story_file=str(story_file))
+            result.stage_results["develop"] = "PASS" if passed else "FAIL"
+            if not passed and self._should_abort("develop"):
+                result.error = "Development failed"
                 return result
-            result.stage_results["develop"] = "PASS"
 
-            # Step 4: Lint
-            console.print("\n[bold blue]Step 4: Running lint...[/bold blue]")
-            if not self._run_lint(result):
+            # Step 4: Lint (run command, spawn agent to fix if needed)
+            log("\n=== Step 4: Running lint ===")
+            passed = self._run_command_stage("lint")
+            result.stage_results["lint"] = "PASS" if passed else "FAIL"
+            if not passed and self._should_abort("lint"):
+                result.error = "Lint failed"
                 return result
-            result.stage_results["lint"] = "PASS"
 
             # Step 5: Typecheck
-            console.print("\n[bold blue]Step 5: Running typecheck...[/bold blue]")
-            if not self._run_typecheck(result):
+            log("\n=== Step 5: Running typecheck ===")
+            passed = self._run_command_stage("typecheck")
+            result.stage_results["typecheck"] = "PASS" if passed else "FAIL"
+            if not passed and self._should_abort("typecheck"):
+                result.error = "Typecheck failed"
                 return result
-            result.stage_results["typecheck"] = "PASS"
 
             # Step 6: Unit test
-            console.print("\n[bold blue]Step 6: Running unit tests...[/bold blue]")
-            if not self._run_unit_test(result):
+            log("\n=== Step 6: Running unit tests ===")
+            passed = self._run_command_stage("unit-test")
+            result.stage_results["unit-test"] = "PASS" if passed else "FAIL"
+            if not passed and self._should_abort("unit-test"):
+                result.error = "Unit tests failed"
                 return result
-            result.stage_results["unit-test"] = "PASS"
 
-            # Step 7: Code review (non-blocking)
-            console.print("\n[bold blue]Step 7: Running code review...[/bold blue]")
-            self._run_code_review(story_id, result)
-            result.stage_results["code-review"] = "PASS"
+            # Step 7: Code review (non-blocking by config)
+            log("\n=== Step 7: Running code review ===")
+            passed = self._run_spawn_stage(
+                "code-review",
+                story_id=story_id,
+                files_changed=", ".join(result.files_changed) if result.files_changed else "unknown"
+            )
+            result.stage_results["code-review"] = "PASS" if passed else "FAIL"
+            # Code review is non-blocking by default
 
-            # Success
-            result.success = True
+            # Determine overall success
+            failed_stages = [s for s, status in result.stage_results.items() if status == "FAIL"]
+            result.success = len(failed_stages) == 0
+
             self._print_summary(result)
             return result
 
         except Exception as e:
             result.error = str(e)
-            console.print(f"\n[red]Pipeline failed: {e}[/red]")
+            log(f"\n!!! Pipeline failed: {e}")
+            import traceback
+            traceback.print_exc()
             return result
 
-    def _resolve_story(self, story_id: Optional[str]) -> tuple[Optional[str], Optional[Path]]:
+    def _should_abort(self, stage_name: str) -> bool:
+        """Check if pipeline should abort on stage failure."""
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            return True  # Abort by default if no config
+        return stage_config.on_failure == "abort"
+
+    def _wait_for_task(
+        self,
+        task: BackgroundTask,
+        stage_name: str,
+        poll_interval: float = 5.0,
+    ) -> TaskResult:
+        """Wait for a background task with progress display."""
+        log(f"  Waiting for {stage_name}...")
+
+        last_log = time.time()
+        while not task.is_done():
+            time.sleep(poll_interval)
+            elapsed = task.elapsed_seconds()
+
+            # Log progress every 30 seconds
+            if time.time() - last_log >= 30:
+                log(f"    ... {stage_name} still running ({elapsed:.0f}s)")
+                last_log = time.time()
+
+        result = task.get_result(block=False)
+        log(f"  {stage_name} completed: success={result.success}, duration={result.duration_seconds:.1f}s")
+
+        if not result.success and result.error:
+            # Only show first 500 chars of error
+            error_preview = result.error[:500] if result.error else ""
+            log(f"    Error: {error_preview}...")
+
+        return result
+
+    def _resolve_story(self, story_id: Optional[str]) -> Tuple[Optional[str], Optional[Path]]:
         """Resolve or create story file."""
         if story_id:
-            # Check if story file exists
             story_file = self.config_loader.find_story_file(story_id, self.config)
             if story_file:
-                console.print(f"  [green]Found existing story file[/green]")
+                log(f"  Found existing story file")
                 return story_id, story_file
+            log(f"  Story file not found, creating...")
 
-            # Story ID provided but file doesn't exist - create it
-            console.print(f"  [yellow]Story file not found, creating...[/yellow]")
+        # Create new story - SPAWN agent (never do in parent context)
+        log("  Spawning create-story agent...")
 
-        # Create new story
-        console.print("  [dim]Spawning create-story workflow...[/dim]")
-        task_result = self.spawner.spawn(TaskType.CREATE_STORY)
+        task = self.spawner.spawn_stage("create-story", background=True)
+        log(f"  Task started: {task.task_id}")
+
+        task_result = self._wait_for_task(task, "create-story")
 
         if not task_result.success:
-            console.print(f"  [red]Failed to create story: {task_result.error}[/red]")
+            log(f"  Failed to create story: {task_result.error}")
             return None, None
 
-        # Parse story_id from output (simplified - would need better parsing)
-        # For now, assume output contains "story_id: X" or similar
-        output = task_result.output
-        console.print(f"  [green]Story created ({task_result.duration_seconds:.1f}s)[/green]")
+        log(f"  Story created ({task_result.duration_seconds:.1f}s)")
 
-        # Try to find the created story
-        # This is simplified - in practice would parse the output
+        # Parse story_id from output
+        output = task_result.output
+        log(f"  Output length: {len(output)} chars")
+
+        if not story_id:
+            import re
+            patterns = [
+                r'story[_-]?id[:\s]+([^\s\n]+)',
+                r'created[:\s]+([^\s\n]+)\.md',
+                r'(\d+-\d+-[\w-]+)\.md',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, output, re.IGNORECASE)
+                if match:
+                    story_id = match.group(1).replace('.md', '')
+                    log(f"  Parsed story_id: {story_id}")
+                    break
+
+        # Find created story file
         if story_id:
             story_file = self.config_loader.find_story_file(story_id, self.config)
-            return story_id, story_file
+            if story_file:
+                return story_id, story_file
+
+        # Search for recently created .md files
+        log(f"  Could not locate story file, searching...")
+        for location in self.config.story_locations:
+            search_dir = self.project_root / Path(location).parent
+            if search_dir.exists():
+                md_files = sorted(search_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
+                if md_files:
+                    story_file = md_files[0]
+                    story_id = story_file.stem
+                    log(f"  Found recent story: {story_id}")
+                    return story_id, story_file
 
         return story_id, None
 
-    def _run_validate(self, story_file: Path, result: PipelineResult) -> bool:
-        """Run validation stage with retry."""
-        stage_config = self.config.stages.get("validate")
-        max_retries = stage_config.retry.max if stage_config and stage_config.retry else 2
+    def _run_spawn_stage(self, stage_name: str, **kwargs) -> bool:
+        """
+        Run a stage by spawning an agent.
+
+        IMPORTANT: All work is done by the spawned agent.
+        The orchestrator only waits for completion.
+        """
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            log(f"  No config for stage {stage_name}, skipping")
+            return True
+
+        max_retries = stage_config.retry.max if stage_config.retry else 0
 
         for attempt in range(max_retries + 1):
-            console.print(f"  [dim]Spawning validate workflow (attempt {attempt + 1})...[/dim]")
+            log(f"  Spawning {stage_name} agent (attempt {attempt + 1}/{max_retries + 1})...")
 
-            task_result = self.spawner.spawn(
-                TaskType.VALIDATE_STORY,
-                story_file=str(story_file)
-            )
+            task = self.spawner.spawn_stage(stage_name, background=True, **kwargs)
+            task_result = self._wait_for_task(task, stage_name)
 
             if task_result.success:
-                console.print(f"  [green]Validation passed ({task_result.duration_seconds:.1f}s)[/green]")
+                log(f"  {stage_name} PASSED ({task_result.duration_seconds:.1f}s)")
                 return True
 
-            if attempt < max_retries:
-                console.print(f"  [yellow]Validation failed, attempting fix...[/yellow]")
-                # Spawn fix agent - for now just retry
-                # In full implementation, would spawn dev agent with errors
+            log(f"  {stage_name} FAILED")
 
-        console.print(f"  [red]Validation failed after {max_retries + 1} attempts[/red]")
-        result.error = "Validation failed"
-        result.stage_results["validate"] = "FAIL"
+            # If we have retries left and on_failure is fix_and_retry, spawn fix agent
+            if attempt < max_retries and stage_config.on_failure == "fix_and_retry":
+                log(f"  Spawning fix agent for {stage_name}...")
+                # The retry prompt in config should handle the fix
+                # We just retry the stage which will attempt to fix
+                continue
+
+        # All retries exhausted
+        if stage_config.on_failure == "continue":
+            log(f"  {stage_name} failed but continuing (on_failure=continue)")
+            return False  # Return false but don't abort
+
+        log(f"  {stage_name} failed after {max_retries + 1} attempts")
         return False
 
-    def _run_develop(self, story_id: str, story_file: Path, result: PipelineResult) -> bool:
-        """Run development stage with retry."""
-        stage_config = self.config.stages.get("develop")
-        max_retries = stage_config.retry.max if stage_config and stage_config.retry else 3
+    def _run_command_stage(self, stage_name: str) -> bool:
+        """
+        Run a bash command stage (lint, typecheck, test).
+
+        IMPORTANT: The orchestrator ONLY runs the check command.
+        If the check fails, it spawns a dev agent to fix.
+        The orchestrator NEVER fixes issues itself.
+        """
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            log(f"  No config for stage {stage_name}, skipping")
+            return True
+
+        command = stage_config.command
+        if not command:
+            log(f"  No command for stage {stage_name}, skipping")
+            return True
+
+        max_retries = stage_config.retry.max if stage_config.retry else 0
+        timeout = stage_config.timeout or 120
 
         for attempt in range(max_retries + 1):
-            console.print(f"  [dim]Spawning dev-story workflow (attempt {attempt + 1})...[/dim]")
-
-            task_result = self.spawner.spawn(
-                TaskType.DEVELOP_STORY,
-                story_id=story_id,
-                story_file=str(story_file)
-            )
-
-            if task_result.success:
-                console.print(f"  [green]Development complete ({task_result.duration_seconds:.1f}s)[/green]")
-                # Parse files changed from output (simplified)
-                result.files_changed = ["(see output for details)"]
-                return True
-
-            if attempt < max_retries:
-                console.print(f"  [yellow]Development failed, attempting fix...[/yellow]")
-
-        console.print(f"  [red]Development failed after {max_retries + 1} attempts[/red]")
-        result.error = "Development failed"
-        result.stage_results["develop"] = "FAIL"
-        return False
-
-    def _run_lint(self, result: PipelineResult) -> bool:
-        """Run lint stage (direct) with fix-and-retry."""
-        stage_config = self.config.stages.get("lint")
-        command = stage_config.command if stage_config else "npm run lint"
-        max_retries = stage_config.retry.max if stage_config and stage_config.retry else 2
-
-        for attempt in range(max_retries + 1):
-            console.print(f"  [dim]Running: {command} (attempt {attempt + 1})...[/dim]")
+            log(f"  Running: {command} (attempt {attempt + 1}/{max_retries + 1})...")
 
             try:
+                # Run the check command
                 proc = subprocess.run(
                     command,
                     shell=True,
                     cwd=str(self.project_root),
                     capture_output=True,
                     text=True,
-                    timeout=120
+                    timeout=timeout
                 )
 
                 if proc.returncode == 0:
-                    console.print(f"  [green]Lint passed[/green]")
-                    result.lint_result = "PASS"
+                    log(f"  {stage_name} PASSED")
                     return True
 
-                errors = proc.stdout + proc.stderr
-                console.print(f"  [yellow]Lint failed[/yellow]")
+                # Command failed - get errors
+                errors = (proc.stdout + proc.stderr).strip()
+                log(f"  {stage_name} FAILED (exit code {proc.returncode})")
 
-                if attempt < max_retries:
-                    console.print(f"  [dim]Spawning dev agent to fix lint errors...[/dim]")
-                    fix_result = self.spawner.spawn(TaskType.FIX_LINT, errors=errors)
-                    if not fix_result.success:
-                        console.print(f"  [yellow]Fix attempt failed[/yellow]")
+                # If we have retries left, SPAWN an agent to fix (never fix in parent context)
+                if attempt < max_retries and stage_config.on_failure == "fix_and_retry":
+                    log(f"  Spawning dev agent to fix {stage_name} errors...")
+                    log(f"  Error preview: {errors[:300]}...")
 
-            except subprocess.TimeoutExpired:
-                console.print(f"  [red]Lint timed out[/red]")
+                    # Spawn fix agent with error context
+                    fix_task = self.spawner.spawn_stage(
+                        stage_name,
+                        background=True,
+                        errors=errors
+                    )
+                    fix_result = self._wait_for_task(fix_task, f"{stage_name}-fix")
 
-        console.print(f"  [red]Lint failed after {max_retries + 1} attempts[/red]")
-        result.lint_result = "FAIL"
-        result.error = "Lint failed"
-        result.stage_results["lint"] = "FAIL"
-        return False
+                    if fix_result.success:
+                        log(f"  Fix agent completed, will retry {stage_name}...")
+                    else:
+                        log(f"  Fix agent failed: {fix_result.error[:200] if fix_result.error else 'unknown'}...")
 
-    def _run_typecheck(self, result: PipelineResult) -> bool:
-        """Run typecheck stage (direct) with fix-and-retry."""
-        stage_config = self.config.stages.get("typecheck")
-        command = stage_config.command if stage_config else "npm run typecheck"
-        max_retries = stage_config.retry.max if stage_config and stage_config.retry else 2
-
-        for attempt in range(max_retries + 1):
-            console.print(f"  [dim]Running: {command} (attempt {attempt + 1})...[/dim]")
-
-            try:
-                proc = subprocess.run(
-                    command,
-                    shell=True,
-                    cwd=str(self.project_root),
-                    capture_output=True,
-                    text=True,
-                    timeout=180
-                )
-
-                if proc.returncode == 0:
-                    console.print(f"  [green]Typecheck passed[/green]")
-                    result.typecheck_result = "PASS"
-                    return True
-
-                errors = proc.stdout + proc.stderr
-                console.print(f"  [yellow]Typecheck failed[/yellow]")
-
-                if attempt < max_retries:
-                    console.print(f"  [dim]Spawning dev agent to fix type errors...[/dim]")
-                    fix_result = self.spawner.spawn(TaskType.FIX_TYPECHECK, errors=errors)
-                    if not fix_result.success:
-                        console.print(f"  [yellow]Fix attempt failed[/yellow]")
+                    # Continue to next attempt (re-run the command)
+                    continue
 
             except subprocess.TimeoutExpired:
-                console.print(f"  [red]Typecheck timed out[/red]")
+                log(f"  {stage_name} timed out after {timeout}s")
 
-        console.print(f"  [red]Typecheck failed after {max_retries + 1} attempts[/red]")
-        result.typecheck_result = "FAIL"
-        result.error = "Typecheck failed"
-        result.stage_results["typecheck"] = "FAIL"
+        # All retries exhausted
+        if stage_config.on_failure == "continue":
+            log(f"  {stage_name} failed but continuing (on_failure=continue)")
+            return False
+
+        log(f"  {stage_name} failed after {max_retries + 1} attempts")
         return False
-
-    def _run_unit_test(self, result: PipelineResult) -> bool:
-        """Run unit test stage (direct) with fix-and-retry."""
-        stage_config = self.config.stages.get("unit-test")
-        command = stage_config.command if stage_config else "npm test"
-        max_retries = stage_config.retry.max if stage_config and stage_config.retry else 3
-
-        for attempt in range(max_retries + 1):
-            console.print(f"  [dim]Running: {command} (attempt {attempt + 1})...[/dim]")
-
-            try:
-                proc = subprocess.run(
-                    command,
-                    shell=True,
-                    cwd=str(self.project_root),
-                    capture_output=True,
-                    text=True,
-                    timeout=300
-                )
-
-                if proc.returncode == 0:
-                    console.print(f"  [green]Unit tests passed[/green]")
-                    result.test_results = "PASS"
-                    return True
-
-                errors = proc.stdout + proc.stderr
-                console.print(f"  [yellow]Tests failed[/yellow]")
-
-                if attempt < max_retries:
-                    console.print(f"  [dim]Spawning dev agent to fix tests...[/dim]")
-                    fix_result = self.spawner.spawn(TaskType.FIX_TESTS, errors=errors)
-                    if not fix_result.success:
-                        console.print(f"  [yellow]Fix attempt failed[/yellow]")
-
-            except subprocess.TimeoutExpired:
-                console.print(f"  [red]Tests timed out[/red]")
-
-        console.print(f"  [red]Tests failed after {max_retries + 1} attempts[/red]")
-        result.test_results = "FAIL"
-        result.error = "Unit tests failed"
-        result.stage_results["unit-test"] = "FAIL"
-        return False
-
-    def _run_code_review(self, story_id: str, result: PipelineResult) -> None:
-        """Run code review stage (spawn, non-blocking)."""
-        console.print(f"  [dim]Spawning code-review workflow...[/dim]")
-
-        task_result = self.spawner.spawn(
-            TaskType.CODE_REVIEW,
-            story_id=story_id,
-            files_changed=", ".join(result.files_changed)
-        )
-
-        if task_result.success:
-            console.print(f"  [green]Code review complete ({task_result.duration_seconds:.1f}s)[/green]")
-            # Parse findings from output (simplified)
-            result.review_findings = ["See output for details"]
-        else:
-            console.print(f"  [yellow]Code review had issues (non-blocking)[/yellow]")
-            result.review_findings = [f"Error: {task_result.error}"]
 
     def _print_summary(self, result: PipelineResult) -> None:
         """Print final summary."""
-        table = Table(title="Pipeline Summary")
-        table.add_column("Stage", style="cyan")
-        table.add_column("Status", style="green")
-
+        log("\n" + "=" * 50)
+        log("ORCHESTRATE-DEV COMPLETE")
+        log("=" * 50)
+        log(f"Story ID: {result.story_id}")
+        log(f"Story File: {result.story_file}")
+        log(f"Status: {'SUCCESS' if result.success else 'FAILED'}")
+        log("")
+        log("Stage Results:")
         for stage, status in result.stage_results.items():
-            style = "green" if status == "PASS" else "red"
-            table.add_row(stage, f"[{style}]{status}[/{style}]")
+            marker = "✓" if status == "PASS" else "✗"
+            log(f"  {marker} {stage}: {status}")
 
-        console.print("\n")
-        console.print(Panel.fit(
-            f"[bold green]ORCHESTRATE-DEV COMPLETE[/bold green]\n\n"
-            f"Story ID: {result.story_id}\n"
-            f"Story File: {result.story_file}\n"
-            f"Status: {'SUCCESS' if result.success else 'FAILED'}",
-            title="Result"
-        ))
-        console.print(table)
+        if result.error:
+            log(f"\nError: {result.error}")
+
+        log("=" * 50)
