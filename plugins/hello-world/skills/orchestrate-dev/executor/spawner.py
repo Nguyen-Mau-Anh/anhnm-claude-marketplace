@@ -130,6 +130,7 @@ class ClaudeSpawner:
             return None
 
         kwargs["autonomy"] = self.config.autonomy_instructions
+        kwargs["project_root"] = str(self.project_root)
 
         try:
             return stage.prompt.format(**kwargs).strip()
@@ -137,6 +138,7 @@ class ClaudeSpawner:
             prompt = stage.prompt
             kwargs_with_defaults = {
                 "autonomy": self.config.autonomy_instructions,
+                "project_root": str(self.project_root),
                 "story_id": kwargs.get("story_id", "{story_id}"),
                 "story_file": kwargs.get("story_file", "{story_file}"),
                 "errors": kwargs.get("errors", "{errors}"),

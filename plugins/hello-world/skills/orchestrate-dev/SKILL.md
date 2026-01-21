@@ -19,35 +19,33 @@ Automated story development pipeline with quality gates.
 
 **CRITICAL: You MUST run the Python executor via bash. Do NOT try to execute the pipeline steps manually.**
 
-### Step 1: Install Dependencies (REQUIRED)
+### Run the Executor
 
-Run this BEFORE any orchestrator command:
+Run this single command - it checks dependencies and runs the pipeline:
+
 ```bash
-pip install -q -r "${PWD}/.claude/skills/orchestrate-dev/requirements.txt" 2>/dev/null || pip install rich typer pydantic pyyaml
+python3 -c "import rich, typer, pydantic, yaml" 2>/dev/null || pip install -q rich typer pydantic pyyaml; PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor
 ```
 
-### Step 2: Run the Executor
-
-The executor spawns Claude agents via `claude --print` for each pipeline stage.
-
+For a specific story:
 ```bash
-PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor
+python3 -c "import rich, typer, pydantic, yaml" 2>/dev/null || pip install -q rich typer pydantic pyyaml; PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor <story_id>
 ```
 
 ### Command Reference
 
 | Command | Full Execution |
 |---------|----------------|
-| `/orchestrate-dev` | `PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor` |
-| `/orchestrate-dev <story_id>` | `PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor <story_id>` |
+| `/orchestrate-dev` | `python3 -c "import rich, typer, pydantic, yaml" 2>/dev/null \|\| pip install -q rich typer pydantic pyyaml; PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor` |
+| `/orchestrate-dev <story_id>` | `python3 -c "import rich, typer, pydantic, yaml" 2>/dev/null \|\| pip install -q rich typer pydantic pyyaml; PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor <story_id>` |
 
 **Example:**
 ```bash
 # Run next story from backlog
-PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor
+python3 -c "import rich, typer, pydantic, yaml" 2>/dev/null || pip install -q rich typer pydantic pyyaml; PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor
 
 # Run specific story
-PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor 1-2-user-auth
+python3 -c "import rich, typer, pydantic, yaml" 2>/dev/null || pip install -q rich typer pydantic pyyaml; PYTHONPATH="${PWD}/.claude/skills/orchestrate-dev" python3 -m executor 1-2-user-auth
 ```
 
 ## How It Works

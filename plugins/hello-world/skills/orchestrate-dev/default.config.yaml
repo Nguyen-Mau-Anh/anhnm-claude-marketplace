@@ -14,6 +14,7 @@
 #   {errors}        - Error output from failed command (for fix stages)
 #   {files_changed} - List of changed files (for code review)
 #   {autonomy}      - Auto-injected autonomy instructions
+#   {project_root}  - Absolute path to project root directory
 
 name: orchestrate-dev
 version: "1.0.0"
@@ -47,7 +48,7 @@ stages:
     type: bmad_workflow
     workflow: /bmad:bmm:workflows:create-story
     condition: story_file_not_exists
-    timeout: 300
+    timeout: 3600
     on_failure: abort
     description: "Create story file from epics if it doesn't exist"
     prompt: |
@@ -64,7 +65,7 @@ stages:
     execution: spawn
     type: bmad_workflow
     workflow: /bmad:bmm:workflows:implementation-readiness
-    timeout: 180
+    timeout: 3600
     on_failure: fix_and_retry
     retry:
       max: 2
@@ -90,7 +91,7 @@ stages:
     execution: spawn
     type: bmad_workflow
     workflow: /bmad:bmm:workflows:dev-story
-    timeout: 900
+    timeout: 21600
     on_failure: fix_and_retry
     retry:
       max: 3
@@ -107,28 +108,85 @@ stages:
       Output: List of files changed and implementation summary.
 
   # Stage 4: Run linting (direct - lightweight)
+  # Uses spawn agent to discover and run ALL lint checks the project uses
   lint:
     order: 4
     enabled: true
-    execution: direct
-    type: bash
-    command: "npm run lint"
-    timeout: 120
+    execution: spawn
+    type: lint_check
+    timeout: 3600
     on_failure: fix_and_retry
     retry:
-      max: 2
-      fix_agent: /bmad:bmm:agents:dev
-      fix_prompt: "Fix the lint errors shown above"
-    description: "Check code style and formatting"
+      max: 3
+    description: "Discover and run all project lint checks"
     prompt: |
-      /bmad:bmm:agents:dev
       {autonomy}
-      Fix the following lint errors:
 
-      {errors}
+      PROJECT ROOT: {project_root}
 
-      Apply fixes and ensure code passes linting.
-      Output: Summary of fixes applied.
+      You are a dev agent responsible for running ALL lint/format checks this project uses and fixing any issues.
+
+      STEP 1: DISCOVER LINT TOOLS
+      First, discover what lint/format tools this project uses by checking:
+
+      1. Read package.json scripts section - look for:
+         - "lint", "lint:fix", "eslint"
+         - "format", "format:check", "prettier"
+         - "check", "validate"
+         - Any script containing "lint", "format", "check"
+
+      2. Check for config files that indicate tools:
+         - .eslintrc.* or eslint.config.* → ESLint
+         - .prettierrc.* or prettier.config.* → Prettier
+         - biome.json or biome.jsonc → Biome
+         - .stylelintrc.* → Stylelint
+         - tslint.json → TSLint (deprecated)
+         - .markdownlint.* → Markdownlint
+         - .commitlintrc.* → Commitlint
+
+      3. Check package.json devDependencies for:
+         - eslint, @eslint/* → ESLint
+         - prettier → Prettier
+         - @biomejs/biome → Biome
+         - stylelint → Stylelint
+         - oxlint → OxLint
+
+      STEP 2: RUN ALL LINT CHECKS
+      Run each discovered lint check command. Common patterns:
+      - npm run lint / pnpm lint / yarn lint
+      - npm run format:check / pnpm format:check
+      - npx eslint .
+      - npx prettier --check .
+      - npx biome check .
+
+      STEP 3: FIX ALL ERRORS
+      For each type of error found:
+
+      A. ESLint/OxLint errors:
+         - Read the file with errors
+         - Fix code issues (unused vars, missing imports, etc.)
+         - Use Edit tool to apply fixes
+
+      B. Prettier/Biome formatting errors:
+         - Run auto-fix command: `npx prettier --write <file>` or `npx biome format --write <file>`
+         - If auto-fix unavailable, manually fix formatting
+
+      C. Stylelint errors:
+         - Read CSS/SCSS file
+         - Fix style issues or run `npx stylelint --fix <file>`
+
+      D. Other lint errors:
+         - Read the error message carefully
+         - Check if tool has --fix flag
+         - Otherwise manually fix
+
+      STEP 4: VERIFY ALL CHECKS PASS
+      Re-run ALL discovered lint commands to ensure everything passes.
+
+      Output:
+      - List of lint tools discovered
+      - Errors found and fixed
+      - Final verification status
 
   # Stage 5: Run type checking (direct - lightweight)
   typecheck:
@@ -137,7 +195,7 @@ stages:
     execution: direct
     type: bash
     command: "npm run typecheck"
-    timeout: 180
+    timeout: 3600
     on_failure: fix_and_retry
     retry:
       max: 2
@@ -145,14 +203,31 @@ stages:
       fix_prompt: "Fix the TypeScript type errors shown above"
     description: "Check TypeScript types"
     prompt: |
-      /bmad:bmm:agents:dev
       {autonomy}
-      Fix the following TypeScript type errors:
 
+      PROJECT ROOT: {project_root}
+
+      You are a dev agent fixing TypeScript type errors. The typecheck command `npm run typecheck` failed.
+
+      TYPE ERRORS:
+      ```
       {errors}
+      ```
 
-      Apply fixes and ensure code passes type checking.
-      Output: Summary of fixes applied.
+      INSTRUCTIONS:
+      1. Parse the error output to identify files and line numbers with type errors
+      2. Read each file that has errors using the Read tool
+      3. Understand the type mismatch and fix the type annotations or code logic
+      4. Use the Edit tool to apply fixes
+      5. After fixing, run `npm run typecheck` to verify all errors are resolved
+
+      Common fixes:
+      - Add missing type annotations
+      - Fix incorrect types (string vs number, etc.)
+      - Add null checks for potentially undefined values
+      - Import missing type definitions
+
+      Output: Summary of files fixed and changes made.
 
   # Stage 6: Run unit tests (direct - lightweight)
   unit-test:
@@ -161,7 +236,7 @@ stages:
     execution: direct
     type: bash
     command: "npm test"
-    timeout: 300
+    timeout: 3600
     on_failure: fix_and_retry
     retry:
       max: 3
@@ -169,14 +244,30 @@ stages:
       fix_prompt: "Fix the failing tests shown above"
     description: "Run all unit tests"
     prompt: |
-      /bmad:bmm:agents:dev
       {autonomy}
-      Fix the following failing tests:
 
+      PROJECT ROOT: {project_root}
+
+      You are a dev agent fixing failing unit tests. The test command `npm test` failed.
+
+      TEST FAILURES:
+      ```
       {errors}
+      ```
 
-      Fix either the tests or the implementation as appropriate.
-      Output: Summary of fixes applied.
+      INSTRUCTIONS:
+      1. Parse the error output to identify which tests failed and why
+      2. Read the failing test file(s) using the Read tool
+      3. Read the implementation file(s) being tested
+      4. Determine if the bug is in the test or the implementation:
+         - If the test expectation is wrong, fix the test
+         - If the implementation is wrong, fix the implementation
+      5. Use the Edit tool to apply fixes
+      6. After fixing, run `npm test` to verify all tests pass
+
+      Focus on fixing ONLY the failing tests. Do not add new tests or refactor passing code.
+
+      Output: Summary of what was fixed (test or implementation) and changes made.
 
   # Stage 7: Code review (spawn - heavy workflow)
   code-review:
@@ -185,7 +276,7 @@ stages:
     execution: spawn
     type: bmad_workflow
     workflow: /bmad:bmm:workflows:code-review
-    timeout: 300
+    timeout: 3600
     on_failure: continue
     blocking: false
     description: "Review code quality, security, and architecture"

@@ -89,25 +89,25 @@ class PipelineRunner:
                 result.error = "Development failed"
                 return result
 
-            # Step 4: Lint (run command, spawn agent to fix if needed)
+            # Step 4: Lint (auto-detect execution type from config)
             log("\n=== Step 4: Running lint ===")
-            passed = self._run_command_stage("lint")
+            passed = self._run_stage("lint", story_id=story_id, story_file=str(story_file))
             result.stage_results["lint"] = "PASS" if passed else "FAIL"
             if not passed and self._should_abort("lint"):
                 result.error = "Lint failed"
                 return result
 
-            # Step 5: Typecheck
+            # Step 5: Typecheck (auto-detect execution type from config)
             log("\n=== Step 5: Running typecheck ===")
-            passed = self._run_command_stage("typecheck")
+            passed = self._run_stage("typecheck", story_id=story_id, story_file=str(story_file))
             result.stage_results["typecheck"] = "PASS" if passed else "FAIL"
             if not passed and self._should_abort("typecheck"):
                 result.error = "Typecheck failed"
                 return result
 
-            # Step 6: Unit test
+            # Step 6: Unit test (auto-detect execution type from config)
             log("\n=== Step 6: Running unit tests ===")
-            passed = self._run_command_stage("unit-test")
+            passed = self._run_stage("unit-test", story_id=story_id, story_file=str(story_file))
             result.stage_results["unit-test"] = "PASS" if passed else "FAIL"
             if not passed and self._should_abort("unit-test"):
                 result.error = "Unit tests failed"
@@ -143,6 +143,33 @@ class PipelineRunner:
         if not stage_config:
             return True  # Abort by default if no config
         return stage_config.on_failure == "abort"
+
+    def _run_stage(self, stage_name: str, **kwargs) -> bool:
+        """
+        Run a stage, auto-detecting execution type from config.
+
+        Routes to _run_spawn_stage or _run_command_stage based on
+        the 'execution' field in stage config.
+        """
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            log(f"  No config for stage {stage_name}, skipping")
+            return True
+
+        if not stage_config.enabled:
+            log(f"  Stage {stage_name} is disabled, skipping")
+            return True
+
+        execution_type = stage_config.execution
+        log(f"  Execution type: {execution_type}")
+
+        if execution_type == "spawn":
+            return self._run_spawn_stage(stage_name, **kwargs)
+        elif execution_type == "direct":
+            return self._run_command_stage(stage_name)
+        else:
+            log(f"  Unknown execution type: {execution_type}, defaulting to spawn")
+            return self._run_spawn_stage(stage_name, **kwargs)
 
     def _wait_for_task(
         self,
