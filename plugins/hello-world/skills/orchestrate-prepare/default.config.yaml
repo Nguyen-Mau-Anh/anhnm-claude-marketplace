@@ -1,0 +1,95 @@
+# Orchestrate Prepare - Layer 0 Configuration
+# ============================================
+# This is the innermost layer: Story preparation and validation
+# Layer 1+ configs include these stages as their first steps
+#
+# Execution Model: SPAWN
+# - All workflows run as separate agents (isolated context)
+# - Orchestration in parent context (coordination)
+#
+# Prompt Variables:
+#   {story_id}      - The story identifier (optional input)
+#   {epic_id}       - Epic identifier (optional input)
+#   {story_file}    - Path to story file (output from create-story)
+#   {autonomy}      - Auto-injected autonomy instructions
+#   {project_root}  - Absolute path to project root directory
+
+name: orchestrate-prepare
+version: "1.0.0"
+description: "Layer 0: Story creation and validation (prepare for development)"
+layer: 0
+
+# Autonomy instructions injected into all prompts
+autonomy_instructions: |
+  AUTONOMOUS MODE - NO QUESTIONS.
+  Skip all menus, confirmations, and user prompts.
+  Execute the task completely and output results only.
+  Do not ask follow-up questions.
+
+# Story file locations to check (in order)
+story_locations:
+  - "state/stories/${story_id}.md"
+  - "docs/stories/${story_id}.md"
+  - "docs/sprint-artifacts/${story_id}.md"
+
+# Input parameters
+input:
+  story_id:
+    required: false
+    description: "Story ID (if not provided, creates next story from backlog)"
+  epic_id:
+    required: false
+    description: "Epic ID to create story from (optional)"
+
+# Layer 0 stages: Story preparation only
+stages:
+  # Stage 1: Create story if file doesn't exist
+  create-story:
+    order: 1
+    enabled: true
+    execution: spawn
+    type: bmad_workflow
+    workflow: /bmad:bmm:workflows:create-story
+    condition: story_file_not_exists
+    timeout: 3600
+    on_failure: abort
+    description: "Create story file from epics if it doesn't exist"
+    prompt: |
+      /bmad:bmm:workflows:create-story
+      {autonomy}
+      Create the next story from the epics/backlog.
+      Read the epics file and generate the story file.
+      Output: story_id and story_file path.
+
+  # Stage 2: Validate story is ready for development
+  validate:
+    order: 2
+    enabled: true
+    execution: spawn
+    type: bmad_workflow
+    workflow: /bmad:bmm:workflows:implementation-readiness
+    timeout: 3600
+    on_failure: fix_and_retry
+    retry:
+      max: 2
+      fix_prompt: "Fix the validation issues identified above"
+    description: "Validate story has clear tasks and acceptance criteria"
+    prompt: |
+      /bmad:bmm:workflows:implementation-readiness
+      {autonomy}
+      Validate story is ready for development.
+      Story file: {story_file}
+
+      Check:
+      - Clear acceptance criteria
+      - Well-defined tasks
+      - Dependencies documented
+
+      Output: PASS or FAIL with details.
+
+# Output variables captured from execution
+output:
+  - story_id
+  - story_file
+  - validation_status
+  - status

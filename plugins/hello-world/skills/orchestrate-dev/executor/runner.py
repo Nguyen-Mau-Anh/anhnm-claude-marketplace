@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
 
-from .config import ConfigLoader, DevConfig
+from .config import ConfigLoader, DevConfig, StageConfig
 from .spawner import ClaudeSpawner, TaskResult, BackgroundTask, TaskStatus
 
 
@@ -75,52 +75,52 @@ class PipelineRunner:
 
             # Step 2: Validate story
             log("\n=== Step 2: Validating story ===")
-            passed = self._run_spawn_stage("validate", story_file=str(story_file))
-            result.stage_results["validate"] = "PASS" if passed else "FAIL"
-            if not passed and self._should_abort("validate"):
+            passed = self._run_stage("validate", story_id=story_id, story_file=str(story_file))
+            result.stage_results["validate"] = "PASS" if passed else "SKIP" if self._is_disabled("validate") else "FAIL"
+            if not passed and not self._is_disabled("validate") and self._should_abort("validate"):
                 result.error = "Validation failed"
                 return result
 
             # Step 3: Develop story
             log("\n=== Step 3: Developing story ===")
-            passed = self._run_spawn_stage("develop", story_id=story_id, story_file=str(story_file))
-            result.stage_results["develop"] = "PASS" if passed else "FAIL"
-            if not passed and self._should_abort("develop"):
+            passed = self._run_stage("develop", story_id=story_id, story_file=str(story_file))
+            result.stage_results["develop"] = "PASS" if passed else "SKIP" if self._is_disabled("develop") else "FAIL"
+            if not passed and not self._is_disabled("develop") and self._should_abort("develop"):
                 result.error = "Development failed"
                 return result
 
-            # Step 4: Lint (auto-detect execution type from config)
+            # Step 4: Lint
             log("\n=== Step 4: Running lint ===")
             passed = self._run_stage("lint", story_id=story_id, story_file=str(story_file))
-            result.stage_results["lint"] = "PASS" if passed else "FAIL"
-            if not passed and self._should_abort("lint"):
+            result.stage_results["lint"] = "PASS" if passed else "SKIP" if self._is_disabled("lint") else "FAIL"
+            if not passed and not self._is_disabled("lint") and self._should_abort("lint"):
                 result.error = "Lint failed"
                 return result
 
-            # Step 5: Typecheck (auto-detect execution type from config)
+            # Step 5: Typecheck
             log("\n=== Step 5: Running typecheck ===")
             passed = self._run_stage("typecheck", story_id=story_id, story_file=str(story_file))
-            result.stage_results["typecheck"] = "PASS" if passed else "FAIL"
-            if not passed and self._should_abort("typecheck"):
+            result.stage_results["typecheck"] = "PASS" if passed else "SKIP" if self._is_disabled("typecheck") else "FAIL"
+            if not passed and not self._is_disabled("typecheck") and self._should_abort("typecheck"):
                 result.error = "Typecheck failed"
                 return result
 
-            # Step 6: Unit test (auto-detect execution type from config)
+            # Step 6: Unit test
             log("\n=== Step 6: Running unit tests ===")
             passed = self._run_stage("unit-test", story_id=story_id, story_file=str(story_file))
-            result.stage_results["unit-test"] = "PASS" if passed else "FAIL"
-            if not passed and self._should_abort("unit-test"):
+            result.stage_results["unit-test"] = "PASS" if passed else "SKIP" if self._is_disabled("unit-test") else "FAIL"
+            if not passed and not self._is_disabled("unit-test") and self._should_abort("unit-test"):
                 result.error = "Unit tests failed"
                 return result
 
-            # Step 7: Code review (non-blocking by config)
+            # Step 7: Code review
             log("\n=== Step 7: Running code review ===")
-            passed = self._run_spawn_stage(
+            passed = self._run_stage(
                 "code-review",
                 story_id=story_id,
                 files_changed=", ".join(result.files_changed) if result.files_changed else "unknown"
             )
-            result.stage_results["code-review"] = "PASS" if passed else "FAIL"
+            result.stage_results["code-review"] = "PASS" if passed else "SKIP" if self._is_disabled("code-review") else "FAIL"
             # Code review is non-blocking by default
 
             # Determine overall success
@@ -143,6 +143,13 @@ class PipelineRunner:
         if not stage_config:
             return True  # Abort by default if no config
         return stage_config.on_failure == "abort"
+
+    def _is_disabled(self, stage_name: str) -> bool:
+        """Check if a stage is disabled in config."""
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            return False  # Not disabled if no config (will be skipped anyway)
+        return not stage_config.enabled
 
     def _run_stage(self, stage_name: str, **kwargs) -> bool:
         """
@@ -388,7 +395,12 @@ class PipelineRunner:
         log("")
         log("Stage Results:")
         for stage, status in result.stage_results.items():
-            marker = "✓" if status == "PASS" else "✗"
+            if status == "PASS":
+                marker = "✓"
+            elif status == "SKIP":
+                marker = "○"
+            else:
+                marker = "✗"
             log(f"  {marker} {stage}: {status}")
 
         if result.error:

@@ -134,7 +134,7 @@ stages:
 
 After completion, shows:
 - Story ID and file path
-- Stage results (PASS/FAIL)
+- Stage results (PASS/FAIL/SKIP)
 - Files changed
 - Review findings
 - Overall status
