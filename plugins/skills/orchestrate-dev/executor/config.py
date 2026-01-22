@@ -32,6 +32,14 @@ class StageConfig(BaseModel):
     prompt: Optional[str] = None
 
 
+class KnowledgeBaseConfig(BaseModel):
+    """Configuration for knowledge base / lessons learned system."""
+    enabled: bool = True
+    max_lessons_per_stage: Optional[int] = None  # None = all lessons
+    min_encounter_count: int = 1
+    stage_overrides: Optional[Dict[str, Dict[str, int]]] = Field(default_factory=dict)
+
+
 class DevConfig(BaseModel):
     """Layer 1 configuration model."""
     name: str = "orchestrate-dev"
@@ -58,6 +66,9 @@ Do not ask follow-up questions."""
         "lint_result", "typecheck_result", "test_results",
         "review_findings", "status"
     ])
+
+    # Knowledge base configuration
+    knowledge_base: KnowledgeBaseConfig = Field(default_factory=KnowledgeBaseConfig)
 
 
 class ConfigLoader:
@@ -105,6 +116,11 @@ class ConfigLoader:
                         stage_data["retry"] = RetryConfig(**stage_data["retry"])
                     stages[name] = StageConfig(**stage_data)
 
+        # Parse knowledge_base config
+        kb_config = KnowledgeBaseConfig()
+        if "knowledge_base" in data and isinstance(data["knowledge_base"], dict):
+            kb_config = KnowledgeBaseConfig(**data["knowledge_base"])
+
         return DevConfig(
             name=data.get("name", "orchestrate-dev"),
             version=data.get("version", "1.0.0"),
@@ -114,6 +130,7 @@ class ConfigLoader:
             story_locations=data.get("story_locations", []),
             stages=stages,
             output=data.get("output", []),
+            knowledge_base=kb_config,
         )
 
     def find_story_file(self, story_id: str, config: DevConfig) -> Optional[Path]:

@@ -60,23 +60,22 @@ class PipelineRunner:
         if not self.config:
             return None  # Default to all lessons if no config
 
-        # Get knowledge_base config section
-        kb_config = self.config.raw_config.get('knowledge_base', {})
+        # Get knowledge_base config
+        kb_config = self.config.knowledge_base
 
         # Check if knowledge base is disabled
-        if not kb_config.get('enabled', True):
+        if not kb_config.enabled:
             return 0  # Don't load any lessons
 
         # Check for per-stage override
-        stage_overrides = kb_config.get('stage_overrides', {})
-        if stage_name in stage_overrides:
-            stage_limit = stage_overrides[stage_name].get('max_lessons')
+        if kb_config.stage_overrides and stage_name in kb_config.stage_overrides:
+            stage_limit = kb_config.stage_overrides[stage_name].get('max_lessons')
             if stage_limit == 0 or stage_limit is None:
                 return None  # All lessons
             return stage_limit
 
         # Get global limit
-        global_limit = kb_config.get('max_lessons_per_stage')
+        global_limit = kb_config.max_lessons_per_stage
         if global_limit == 0 or global_limit is None:
             return None  # All lessons
 
@@ -122,6 +121,14 @@ class PipelineRunner:
             result.stage_results["develop"] = "PASS" if passed else "SKIP" if self._is_disabled("develop") else "FAIL"
             if not passed and not self._is_disabled("develop") and self._should_abort("develop"):
                 result.error = "Development failed"
+                return result
+
+            # Step 3.5: Validate story completion (CRITICAL GATE)
+            log("\n=== Step 3.5: Validating story completion ===")
+            passed = self._run_stage("story-validation", story_id=story_id, story_file=str(story_file))
+            result.stage_results["story-validation"] = "PASS" if passed else "SKIP" if self._is_disabled("story-validation") else "FAIL"
+            if not passed and not self._is_disabled("story-validation") and self._should_abort("story-validation"):
+                result.error = "Story validation failed - story is incomplete"
                 return result
 
             # Step 4: Lint

@@ -83,6 +83,18 @@ stages:
       max: 5                  # More retries
 ```
 
+## Critical Development Rules
+
+**RULE #1: Story Completion Requirements**
+
+Before marking a story as "Done" or "Ready for Review", developers MUST:
+- ✅ Complete ALL checkboxes in the Tasks section (- [x])
+- ✅ Satisfy ALL Acceptance Criteria (- [x])
+- ✅ Remove all "NOT DONE" markers from the story file
+- ✅ Document all changed files in the File List section
+
+**The validation stage will FAIL if any tasks or acceptance criteria are incomplete.**
+
 ## Pipeline Stages
 
 | # | Stage | Execution | On Failure |
