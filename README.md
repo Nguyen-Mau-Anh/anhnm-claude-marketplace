@@ -22,7 +22,7 @@ A personal Claude Code plugin marketplace for custom skills, hooks, commands, ag
 
 | Plugin | Version | Description |
 |--------|---------|-------------|
-| [hello-world](plugins/hello-world) | 1.0.1 | Example plugin demonstrating all component types |
+| [hello-world](plugins) | 1.0.1 | Example plugin demonstrating all component types |
 
 ---
 

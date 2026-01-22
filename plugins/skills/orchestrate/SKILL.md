@@ -53,7 +53,7 @@ fi
 #### Method 3: Direct path (if installed locally)
 ```bash
 # For local development in this marketplace
-PYTHONPATH="./plugins/hello-world/skills/orchestrate" python3 -m orchestrator start
+PYTHONPATH="./plugins/skills/orchestrate" python3 -m orchestrator start
 ```
 
 ### Command Reference

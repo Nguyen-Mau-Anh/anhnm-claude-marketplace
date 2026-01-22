@@ -143,6 +143,7 @@ class ClaudeSpawner:
                 "story_file": kwargs.get("story_file", "{story_file}"),
                 "errors": kwargs.get("errors", "{errors}"),
                 "files_changed": kwargs.get("files_changed", "{files_changed}"),
+                "known_issues": kwargs.get("known_issues", ""),  # Default to empty
             }
             return prompt.format(**kwargs_with_defaults).strip()
 
@@ -448,12 +449,13 @@ class ClaudeSpawner:
             if stage:
                 timeout = stage.timeout
 
-        return self.spawn_with_prompt(prompt, timeout)
+        return self.spawn_with_prompt(prompt, timeout, stage_name=stage_name)
 
     def spawn_with_prompt(
         self,
         prompt: str,
         timeout: Optional[int] = None,
+        stage_name: Optional[str] = None,
     ) -> TaskResult:
         """
         Spawn Claude CLI with a pre-built prompt (blocking).
@@ -467,8 +469,11 @@ class ClaudeSpawner:
         temp_dir = self.project_root / ".orchestrate-temp"
         temp_dir.mkdir(exist_ok=True)
 
+        # Determine task label for file names and logging
+        task_label = stage_name if stage_name else "task"
+
         # Create temp files for output
-        task_id = f"blocking_{int(time.time())}"
+        task_id = f"{task_label}_{int(time.time())}"
         stdout_path = temp_dir / f"{task_id}.stdout"
         stderr_path = temp_dir / f"{task_id}.stderr"
 
@@ -501,11 +506,11 @@ class ClaudeSpawner:
                 elapsed = time.time() - start_time
 
                 if time.time() - last_log >= 30:
-                    print(f"[spawner] Blocking task still running ({elapsed:.0f}s)", flush=True)
+                    print(f"[spawner] {task_label} still running ({elapsed:.0f}s)", flush=True)
                     last_log = time.time()
 
                 if elapsed > actual_timeout:
-                    print(f"[spawner] Blocking task TIMEOUT", flush=True)
+                    print(f"[spawner] {task_label} TIMEOUT", flush=True)
                     self._kill_process_tree(process)
 
                     stdout_file.flush()

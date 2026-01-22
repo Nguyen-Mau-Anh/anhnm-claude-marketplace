@@ -12,7 +12,7 @@
   "plugins": [
     {
       "name": "hello-world",
-      "path": "plugins/hello-world",
+      "path": "plugins",
       "description": "Example plugin demonstrating skills, hooks, commands, and agents"
     }
   ]

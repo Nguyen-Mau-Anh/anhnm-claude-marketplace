@@ -34,6 +34,20 @@ story_locations:
   - "docs/stories/${story_id}.md"
   - "docs/sprint-artifacts/${story_id}.md"
 
+# Knowledge Base Configuration
+# Controls how lessons learned are captured and applied
+knowledge_base:
+  enabled: true                    # Enable/disable knowledge base system
+  max_lessons_per_stage: null      # Max lessons to show per stage (null = all, 0 = all, number = limit)
+  min_encounter_count: 1           # Minimum times a lesson must be seen to be included
+
+  # Per-stage overrides (optional)
+  stage_overrides:
+    # lint:
+    #   max_lessons: 10            # Override for specific stage
+    # typecheck:
+    #   max_lessons: 15
+
 # All stages are MANDATORY
 # Execution types:
 #   - spawn: Run as separate agent via Task tool (for BMAD workflows)
@@ -54,6 +68,9 @@ stages:
     prompt: |
       /bmad:bmm:workflows:create-story
       {autonomy}
+
+      {known_issues}
+
       Create the next story from the epics/backlog.
       Read the epics file and generate the story file.
       Output: story_id and story_file path.
@@ -74,6 +91,9 @@ stages:
     prompt: |
       /bmad:bmm:workflows:implementation-readiness
       {autonomy}
+
+      {known_issues}
+
       Validate story is ready for development.
       Story file: {story_file}
 
@@ -100,6 +120,9 @@ stages:
     prompt: |
       /bmad:bmm:workflows:dev-story
       {autonomy}
+
+      {known_issues}
+
       Implement the story following tasks in the story file.
       Story file: {story_file}
       Story ID: {story_id}
@@ -121,6 +144,8 @@ stages:
     description: "Discover and run all project lint checks"
     prompt: |
       {autonomy}
+
+      {known_issues}
 
       PROJECT ROOT: {project_root}
 
@@ -205,6 +230,8 @@ stages:
     prompt: |
       {autonomy}
 
+      {known_issues}
+
       PROJECT ROOT: {project_root}
 
       You are a dev agent fixing TypeScript type errors. The typecheck command `npm run typecheck` failed.
@@ -246,6 +273,8 @@ stages:
     prompt: |
       {autonomy}
 
+      {known_issues}
+
       PROJECT ROOT: {project_root}
 
       You are a dev agent fixing failing unit tests. The test command `npm test` failed.
@@ -283,6 +312,9 @@ stages:
     prompt: |
       /bmad:bmm:workflows:code-review
       {autonomy}
+
+      {known_issues}
+
       Review the implemented code for story {story_id}.
       Files changed: {files_changed}
 

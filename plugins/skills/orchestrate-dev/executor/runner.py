@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from .config import ConfigLoader, DevConfig, StageConfig
 from .spawner import ClaudeSpawner, TaskResult, BackgroundTask, TaskStatus
+from .knowledge import KnowledgeBase, classify_error, extract_error_pattern
 
 
 def log(msg: str) -> None:
@@ -45,7 +46,41 @@ class PipelineRunner:
         self.project_root = Path(project_root)
         self.config_loader = ConfigLoader(project_root)
         self.spawner = ClaudeSpawner(project_root)
+        self.knowledge = KnowledgeBase(project_root)
         self.config: Optional[DevConfig] = None
+
+    def _get_knowledge_limit(self, stage_name: str) -> Optional[int]:
+        """
+        Get max lessons limit from config for a stage.
+
+        Returns:
+            None = load all lessons
+            int = limit to N lessons
+        """
+        if not self.config:
+            return None  # Default to all lessons if no config
+
+        # Get knowledge_base config section
+        kb_config = self.config.raw_config.get('knowledge_base', {})
+
+        # Check if knowledge base is disabled
+        if not kb_config.get('enabled', True):
+            return 0  # Don't load any lessons
+
+        # Check for per-stage override
+        stage_overrides = kb_config.get('stage_overrides', {})
+        if stage_name in stage_overrides:
+            stage_limit = stage_overrides[stage_name].get('max_lessons')
+            if stage_limit == 0 or stage_limit is None:
+                return None  # All lessons
+            return stage_limit
+
+        # Get global limit
+        global_limit = kb_config.get('max_lessons_per_stage')
+        if global_limit == 0 or global_limit is None:
+            return None  # All lessons
+
+        return global_limit
 
     def run(self, story_id: Optional[str] = None) -> PipelineResult:
         """Run the complete pipeline."""
@@ -219,7 +254,18 @@ class PipelineRunner:
         # Create new story - SPAWN agent (never do in parent context)
         log("  Spawning create-story agent...")
 
-        task = self.spawner.spawn_stage("create-story", background=True)
+        # Get lessons for create-story stage
+        limit = self._get_knowledge_limit("create-story")
+        lessons = self.knowledge.get_lessons_for_stage("create-story", limit=limit)
+
+        kwargs = {}
+        if lessons:
+            log(f"  📚 Applying {len(lessons)} lesson(s) from previous runs")
+            kwargs['known_issues'] = self.knowledge.format_for_prompt(lessons)
+        else:
+            kwargs['known_issues'] = ""
+
+        task = self.spawner.spawn_stage("create-story", background=True, **kwargs)
         log(f"  Task started: {task.task_id}")
 
         task_result = self._wait_for_task(task, "create-story")
@@ -274,6 +320,8 @@ class PipelineRunner:
 
         IMPORTANT: All work is done by the spawned agent.
         The orchestrator only waits for completion.
+
+        Integrates knowledge base to inject lessons and capture fixes.
         """
         stage_config = self.config.stages.get(stage_name)
         if not stage_config:
@@ -281,6 +329,20 @@ class PipelineRunner:
             return True
 
         max_retries = stage_config.retry.max if stage_config.retry else 0
+
+        # Get relevant lessons for this stage
+        limit = self._get_knowledge_limit(stage_name)
+        lessons = self.knowledge.get_lessons_for_stage(stage_name, limit=limit)
+        lesson_ids = [l["id"] for l in lessons]
+
+        if lessons:
+            log(f"  📚 Applying {len(lessons)} lesson(s) from previous runs")
+            # Add lessons to kwargs for prompt injection
+            kwargs['known_issues'] = self.knowledge.format_for_prompt(lessons)
+        else:
+            kwargs['known_issues'] = ""
+
+        first_error = None
 
         for attempt in range(max_retries + 1):
             log(f"  Spawning {stage_name} agent (attempt {attempt + 1}/{max_retries + 1})...")
@@ -290,13 +352,43 @@ class PipelineRunner:
 
             if task_result.success:
                 log(f"  {stage_name} PASSED ({task_result.duration_seconds:.1f}s)")
+
+                # Track prevention if lessons were shown and first attempt succeeded
+                if lessons and attempt == 0:
+                    self.knowledge.track_prevention(stage_name, lesson_ids)
+                    log(f"  💡 {len(lessons)} lesson(s) helped prevent errors")
+
+                # Capture lesson if this was a fix after failure
+                if attempt > 0 and first_error:
+                    lesson_id = self.knowledge.add_lesson(
+                        stage=stage_name,
+                        error_type=classify_error(first_error),
+                        error_pattern=extract_error_pattern(first_error),
+                        error_message=first_error,
+                        context={
+                            "file": kwargs.get("story_file", "unknown"),
+                            "story_id": kwargs.get("story_id", "unknown")
+                        },
+                        fix={
+                            "description": f"Fix applied after {attempt} retries",
+                            "action": "retry_with_fix"
+                        },
+                        success=True,
+                        story_id=kwargs.get("story_id")
+                    )
+                    log(f"  💡 Saved lesson: {lesson_id}")
+
                 return True
 
             log(f"  {stage_name} FAILED")
 
+            # Save first error for lesson capture
+            if attempt == 0:
+                first_error = task_result.error
+
             # If we have retries left and on_failure is fix_and_retry, spawn fix agent
             if attempt < max_retries and stage_config.on_failure == "fix_and_retry":
-                log(f"  Spawning fix agent for {stage_name}...")
+                log(f"  Attempt {attempt + 1} failed, will retry...")
                 # The retry prompt in config should handle the fix
                 # We just retry the stage which will attempt to fix
                 continue
@@ -316,6 +408,8 @@ class PipelineRunner:
         IMPORTANT: The orchestrator ONLY runs the check command.
         If the check fails, it spawns a dev agent to fix.
         The orchestrator NEVER fixes issues itself.
+
+        Integrates knowledge base to track errors and fixes.
         """
         stage_config = self.config.stages.get(stage_name)
         if not stage_config:
@@ -329,6 +423,16 @@ class PipelineRunner:
 
         max_retries = stage_config.retry.max if stage_config.retry else 0
         timeout = stage_config.timeout or 120
+
+        # Get relevant lessons for this stage
+        limit = self._get_knowledge_limit(stage_name)
+        lessons = self.knowledge.get_lessons_for_stage(stage_name, limit=limit)
+        lesson_ids = [l["id"] for l in lessons]
+
+        if lessons:
+            log(f"  📚 {len(lessons)} lesson(s) available for {stage_name}")
+
+        first_error = None
 
         for attempt in range(max_retries + 1):
             log(f"  Running: {command} (attempt {attempt + 1}/{max_retries + 1})...")
@@ -346,22 +450,56 @@ class PipelineRunner:
 
                 if proc.returncode == 0:
                     log(f"  {stage_name} PASSED")
+
+                    # Track prevention if lessons were available and first attempt succeeded
+                    if lessons and attempt == 0:
+                        self.knowledge.track_prevention(stage_name, lesson_ids)
+                        log(f"  💡 {len(lessons)} lesson(s) helped prevent errors")
+
+                    # Capture lesson if this was a fix after failure
+                    if attempt > 0 and first_error:
+                        lesson_id = self.knowledge.add_lesson(
+                            stage=stage_name,
+                            error_type=classify_error(first_error),
+                            error_pattern=extract_error_pattern(first_error),
+                            error_message=first_error,
+                            context={"command": command},
+                            fix={
+                                "description": f"Fix applied after {attempt} retries",
+                                "action": "fix_agent_applied"
+                            },
+                            success=True,
+                            story_id=None
+                        )
+                        log(f"  💡 Saved lesson: {lesson_id}")
+
                     return True
 
                 # Command failed - get errors
                 errors = (proc.stdout + proc.stderr).strip()
                 log(f"  {stage_name} FAILED (exit code {proc.returncode})")
 
+                # Save first error for lesson capture
+                if attempt == 0:
+                    first_error = errors
+
                 # If we have retries left, SPAWN an agent to fix (never fix in parent context)
                 if attempt < max_retries and stage_config.on_failure == "fix_and_retry":
                     log(f"  Spawning dev agent to fix {stage_name} errors...")
                     log(f"  Error preview: {errors[:300]}...")
 
-                    # Spawn fix agent with error context
+                    # Add lessons to fix agent context
+                    fix_kwargs = {"errors": errors}
+                    if lessons:
+                        fix_kwargs['known_issues'] = self.knowledge.format_for_prompt(lessons)
+                    else:
+                        fix_kwargs['known_issues'] = ""
+
+                    # Spawn fix agent with error context and lessons
                     fix_task = self.spawner.spawn_stage(
                         stage_name,
                         background=True,
-                        errors=errors
+                        **fix_kwargs
                     )
                     fix_result = self._wait_for_task(fix_task, f"{stage_name}-fix")
 

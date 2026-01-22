@@ -133,14 +133,12 @@ class PipelineRunner:
 
         log("  Running create-story workflow...")
 
-        # Build prompt with variables
-        prompt = self._build_prompt(stage_config, story_id=story_id, story_file="")
-
-        # Spawn agent
-        result = self.spawner.spawn(
+        # Spawn agent with context variables
+        result = self.spawner.spawn_stage(
             stage_name="create-story",
-            prompt=prompt,
             timeout=stage_config.timeout,
+            story_id=story_id if story_id else "",
+            story_file="",
         )
 
         if not result.success:
@@ -219,15 +217,12 @@ class PipelineRunner:
             if attempt > 1:
                 log(f"  → Retry {attempt - 1}/{stage_config.retry.max}")
 
-            # Build prompt
-            prompt = self._build_prompt(stage_config, **context)
-
-            # Spawn agent
+            # Spawn agent with context variables
             log(f"  Running {stage_name}...")
-            result = self.spawner.spawn(
+            result = self.spawner.spawn_stage(
                 stage_name=stage_name,
-                prompt=prompt,
                 timeout=stage_config.timeout,
+                **context
             )
 
             if result.success:
