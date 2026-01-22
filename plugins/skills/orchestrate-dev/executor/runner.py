@@ -184,10 +184,15 @@ class PipelineRunner:
 
             # Step 7: Code review
             log("\n=== Step 7: Running code review ===")
+
+            # Collect files changed from git (limit to prevent overload)
+            files_changed_list = self._get_changed_files(limit=20)
+            result.files_changed = files_changed_list
+
             passed = self._run_stage(
                 "code-review",
                 story_id=story_id,
-                files_changed=", ".join(result.files_changed) if result.files_changed else "unknown"
+                files_changed=", ".join(files_changed_list) if files_changed_list else "No files changed"
             )
             result.stage_results["code-review"] = "PASS" if passed else "SKIP" if self._is_disabled("code-review") else "FAIL"
             # Code review is non-blocking by default
@@ -653,6 +658,56 @@ class PipelineRunner:
 
         log(f"  {stage_name} failed after {max_retries + 1} attempts")
         return False
+
+    def _get_changed_files(self, limit: int = 20) -> List[str]:
+        """
+        Get list of changed files from git.
+
+        Args:
+            limit: Maximum number of files to return (prevents overload)
+
+        Returns:
+            List of changed file paths (relative to project root)
+        """
+        try:
+            # Get files changed in working directory + staged
+            result = subprocess.run(
+                ['git', 'diff', '--name-only', 'HEAD'],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode == 0:
+                files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
+
+                # Filter out large or binary files
+                filtered_files = []
+                for file_path in files[:limit]:  # Apply limit
+                    full_path = self.project_root / file_path
+
+                    # Skip if file doesn't exist
+                    if not full_path.exists():
+                        continue
+
+                    # Skip if file is too large (> 100KB)
+                    if full_path.stat().st_size > 100 * 1024:
+                        log(f"  Skipping large file: {file_path} ({full_path.stat().st_size / 1024:.1f}KB)")
+                        continue
+
+                    # Skip binary files (common extensions)
+                    if file_path.endswith(('.png', '.jpg', '.jpeg', '.gif', '.pdf', '.zip', '.tar', '.gz')):
+                        continue
+
+                    filtered_files.append(file_path)
+
+                return filtered_files
+
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, Exception) as e:
+            log(f"  Warning: Could not get changed files from git: {e}")
+
+        return []
 
     def _print_summary(self, result: PipelineResult) -> None:
         """Print final summary."""

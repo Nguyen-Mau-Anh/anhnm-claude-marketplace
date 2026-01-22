@@ -322,13 +322,27 @@ stages:
       {known_issues}
 
       Review the implemented code for story {story_id}.
-      Files changed: {files_changed}
+
+      FILES CHANGED (max 20 files, max 100KB each):
+      {files_changed}
+
+      IMPORTANT FILE LIMITS:
+      - Only up to 20 files are provided for review
+      - Files larger than 100KB are excluded
+      - Binary files are excluded
+      - If you need to review more files, use git diff or Glob/Grep tools
 
       Review for:
       - Code quality
       - Security issues
       - Performance
       - Architecture compliance
+
+      INSTRUCTIONS:
+      1. If files_changed shows "No files changed", use git to find changed files
+      2. Focus on the most critical files first
+      3. Use Grep to search for patterns instead of reading entire large files
+      4. Prioritize security and architecture issues over style
 
       Output: Findings with severity levels.
 
