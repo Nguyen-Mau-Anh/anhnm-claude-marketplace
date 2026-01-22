@@ -16,7 +16,7 @@ class RetryConfig(BaseModel):
 
 class StageConfig(BaseModel):
     """Configuration for a single stage."""
-    order: int = 0  # Made optional with default
+    order: float = 0  # Supports fractional ordering (e.g., 3.5 for between 3 and 4)
     enabled: bool = True
     execution: str = "spawn"  # "spawn" or "direct"
     type: str = "bmad_workflow"  # "bmad_workflow" or "bash"
@@ -38,6 +38,12 @@ class KnowledgeBaseConfig(BaseModel):
     max_lessons_per_stage: Optional[int] = None  # None = all lessons
     min_encounter_count: int = 1
     stage_overrides: Optional[Dict[str, Dict[str, int]]] = Field(default_factory=dict)
+
+
+class TaskDecompositionConfig(BaseModel):
+    """Configuration for task decomposition / task-by-task execution."""
+    enabled: bool = True  # Enable auto task decomposition
+    threshold: int = 6  # Decompose if >= N incomplete tasks
 
 
 class DevConfig(BaseModel):
@@ -69,6 +75,9 @@ Do not ask follow-up questions."""
 
     # Knowledge base configuration
     knowledge_base: KnowledgeBaseConfig = Field(default_factory=KnowledgeBaseConfig)
+
+    # Task decomposition configuration
+    task_decomposition: TaskDecompositionConfig = Field(default_factory=TaskDecompositionConfig)
 
 
 class ConfigLoader:

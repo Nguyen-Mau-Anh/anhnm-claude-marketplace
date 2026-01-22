@@ -15,6 +15,13 @@ from dataclasses import dataclass, field
 from .config import ConfigLoader, DevConfig, StageConfig
 from .spawner import ClaudeSpawner, TaskResult, BackgroundTask, TaskStatus
 from .knowledge import KnowledgeBase, classify_error, extract_error_pattern
+from .task_decomposer import (
+    parse_story_tasks,
+    should_decompose,
+    get_incomplete_tasks,
+    format_task_for_agent,
+    format_tasks_summary,
+)
 
 
 def log(msg: str) -> None:
@@ -115,9 +122,29 @@ class PipelineRunner:
                 result.error = "Validation failed"
                 return result
 
-            # Step 3: Develop story
+            # Step 3: Develop story (with optional task decomposition)
             log("\n=== Step 3: Developing story ===")
-            passed = self._run_stage("develop", story_id=story_id, story_file=str(story_file))
+
+            # Check if task decomposition is enabled
+            decomp_enabled = self.config.task_decomposition.enabled
+            decomp_threshold = self.config.task_decomposition.threshold
+
+            if decomp_enabled:
+                # Parse tasks from story file
+                tasks = parse_story_tasks(story_file)
+                log(f"  Story has {format_tasks_summary(tasks)}")
+
+                # Auto-detect if decomposition is needed
+                if should_decompose(tasks, threshold=decomp_threshold):
+                    log(f"  Using task-by-task execution ({len(get_incomplete_tasks(tasks))} tasks >= {decomp_threshold} threshold)")
+                    passed = self._run_task_by_task_development(story_id, str(story_file), tasks)
+                else:
+                    log(f"  Using standard dev-story workflow (only {len(get_incomplete_tasks(tasks))} incomplete tasks)")
+                    passed = self._run_stage("develop", story_id=story_id, story_file=str(story_file))
+            else:
+                log("  Task decomposition disabled, using standard dev-story workflow")
+                passed = self._run_stage("develop", story_id=story_id, story_file=str(story_file))
+
             result.stage_results["develop"] = "PASS" if passed else "SKIP" if self._is_disabled("develop") else "FAIL"
             if not passed and not self._is_disabled("develop") and self._should_abort("develop"):
                 result.error = "Development failed"
@@ -320,6 +347,104 @@ class PipelineRunner:
                     return story_id, story_file
 
         return story_id, None
+
+    def _run_task_by_task_development(
+        self,
+        story_id: str,
+        story_file: str,
+        tasks: List,
+    ) -> bool:
+        """
+        Execute story development task-by-task with separate agents.
+
+        Each task gets a fresh agent context to prevent context overload
+        and ensure focused implementation.
+
+        Args:
+            story_id: Story identifier
+            story_file: Path to story file
+            tasks: List of Task objects to implement
+
+        Returns:
+            True if all tasks completed successfully, False otherwise
+        """
+        incomplete_tasks = get_incomplete_tasks(tasks)
+
+        if not incomplete_tasks:
+            log("  All tasks already complete!")
+            return True
+
+        log(f"  Executing {len(incomplete_tasks)} tasks one-by-one with fresh agents...")
+
+        # Get knowledge base limit for develop stage
+        limit = self._get_knowledge_limit("develop")
+
+        for task in incomplete_tasks:
+            log(f"\n  --- Task #{task.index}/{len(tasks)} ---")
+            task_preview = task.content.split('\n')[0][:80]
+            log(f"  {task_preview}...")
+
+            # Get lessons for develop stage (same as normal develop)
+            lessons = self.knowledge.get_lessons_for_stage("develop", limit=limit)
+            lesson_ids = [l["id"] for l in lessons]
+
+            if lessons:
+                log(f"  📚 Applying {len(lessons)} lesson(s)")
+
+            # Create focused prompt for this specific task
+            task_prompt = format_task_for_agent(task, story_id, story_file)
+
+            # Add autonomy instructions and known issues
+            full_prompt = f"""
+/bmad:bmm:workflows:dev-story
+{self.config.autonomy_instructions}
+
+{self.knowledge.format_for_prompt(lessons) if lessons else ""}
+
+{task_prompt}
+"""
+
+            # Spawn agent for this task
+            log(f"  Spawning agent for task #{task.index}...")
+            task_bg = self.spawner.spawn_agent(
+                prompt=full_prompt,
+                background=True,
+                task_id_prefix=f"develop-task-{task.index}"
+            )
+
+            # Wait for task completion
+            task_result = self._wait_for_task(task_bg, f"task-{task.index}")
+
+            if not task_result.success:
+                log(f"  Task #{task.index} FAILED: {task_result.error[:200] if task_result.error else 'unknown'}...")
+
+                # Try to fix with retry
+                stage_config = self.config.stages.get("develop")
+                if stage_config and stage_config.retry and stage_config.retry.max > 0:
+                    log(f"  Retrying task #{task.index}...")
+
+                    retry_task = self.spawner.spawn_agent(
+                        prompt=full_prompt,
+                        background=True,
+                        task_id_prefix=f"develop-task-{task.index}-retry"
+                    )
+                    retry_result = self._wait_for_task(retry_task, f"task-{task.index}-retry")
+
+                    if retry_result.success:
+                        log(f"  Task #{task.index} PASSED on retry")
+                        continue
+
+                log(f"  Task #{task.index} failed after retry, aborting")
+                return False
+
+            log(f"  Task #{task.index} PASSED")
+
+            # Track prevention if lessons were shown
+            if lessons:
+                self.knowledge.track_prevention("develop", lesson_ids)
+
+        log(f"\n  All {len(incomplete_tasks)} tasks completed successfully!")
+        return True
 
     def _run_spawn_stage(self, stage_name: str, **kwargs) -> bool:
         """

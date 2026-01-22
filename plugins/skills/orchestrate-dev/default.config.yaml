@@ -48,6 +48,12 @@ knowledge_base:
     # typecheck:
     #   max_lessons: 15
 
+# Task Decomposition Configuration
+# Controls task-by-task execution for large stories
+task_decomposition:
+  enabled: true                    # Enable/disable auto task decomposition
+  threshold: 6                     # Decompose if >= N incomplete tasks (default: 6)
+
 # All stages are MANDATORY
 # Execution types:
 #   - spawn: Run as separate agent via Task tool (for BMAD workflows)
