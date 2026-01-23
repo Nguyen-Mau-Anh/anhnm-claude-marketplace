@@ -57,13 +57,7 @@ class KnowledgeBase:
     def __init__(self, project_root: Path):
         self.project_root = Path(project_root)
         self.kb_file = self.project_root / "state" / "knowledge-base.yaml"
-
-        # Try to create directory, but don't fail if we can't
-        try:
-            self.kb_file.parent.mkdir(parents=True, exist_ok=True)
-        except (OSError, PermissionError) as e:
-            print(f"WARNING: Could not create knowledge base directory: {e}")
-            # Continue anyway - save() will handle errors later
+        self.kb_file.parent.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> Dict:
         """Load knowledge base from YAML file."""
@@ -77,72 +71,19 @@ class KnowledgeBase:
                 "lessons": {}
             }
 
-        try:
-            with open(self.kb_file) as f:
-                data = yaml.safe_load(f)
-                if not data or not isinstance(data, dict):
-                    print(f"WARNING: Invalid knowledge base format, returning empty")
-                    return {
-                        "metadata": {"version": "1.0.0", "total_lessons": 0},
-                        "lessons": {}
-                    }
-                return data
-        except Exception as e:
-            print(f"WARNING: Failed to load knowledge base: {e}")
-            print(f"  File: {self.kb_file}")
-            print(f"  Returning empty knowledge base")
-            return {
+        with open(self.kb_file) as f:
+            return yaml.safe_load(f) or {
                 "metadata": {"version": "1.0.0", "total_lessons": 0},
                 "lessons": {}
             }
 
-    def _make_serializable(self, obj):
-        """
-        Recursively convert objects to YAML-serializable types.
-
-        Converts Path, datetime, and other non-serializable objects to strings.
-        """
-        if isinstance(obj, dict):
-            return {k: self._make_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return [self._make_serializable(item) for item in obj]
-        elif isinstance(obj, Path):
-            return str(obj)
-        elif isinstance(obj, datetime):
-            return obj.isoformat()
-        elif hasattr(obj, '__dict__'):
-            # Convert custom objects to dict
-            return str(obj)
-        else:
-            # Primitive types (str, int, float, bool, None)
-            return obj
-
     def save(self, data: Dict) -> None:
         """Save knowledge base to YAML file."""
-        try:
-            # Ensure directory exists
-            self.kb_file.parent.mkdir(parents=True, exist_ok=True)
+        data["metadata"]["last_updated"] = datetime.now().isoformat()
+        data["metadata"]["total_lessons"] = len(data.get("lessons", {}))
 
-            # Update metadata
-            data["metadata"]["last_updated"] = datetime.now().isoformat()
-            data["metadata"]["total_lessons"] = len(data.get("lessons", {}))
-
-            # Ensure data is serializable (convert Path and other objects to strings)
-            serializable_data = self._make_serializable(data)
-
-            # Write to temp file first (atomic write)
-            temp_file = self.kb_file.with_suffix('.yaml.tmp')
-            with open(temp_file, "w") as f:
-                yaml.dump(serializable_data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-
-            # Rename temp file to actual file (atomic operation)
-            temp_file.replace(self.kb_file)
-
-        except Exception as e:
-            print(f"WARNING: Failed to save knowledge base: {e}")
-            print(f"  File: {self.kb_file}")
-            print(f"  Error type: {type(e).__name__}")
-            # Don't crash - just log the error and continue
+        with open(self.kb_file, "w") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
     def add_lesson(
         self,
@@ -215,16 +156,11 @@ class KnowledgeBase:
         """
         kb = self.load()
 
-        # Filter by stage and success (with defensive checks)
-        stage_lessons = []
-        for lesson_id, lesson in kb.get("lessons", {}).items():
-            # Skip invalid lessons
-            if not isinstance(lesson, dict):
-                continue
-
-            # Check if lesson matches stage and is successful
-            if lesson.get("stage") == stage and lesson.get("success", True):
-                stage_lessons.append(lesson)
+        # Filter by stage and success
+        stage_lessons = [
+            lesson for lesson_id, lesson in kb["lessons"].items()
+            if lesson["stage"] == stage and lesson.get("success", True)
+        ]
 
         # Sort by encounter count and prevention count
         stage_lessons.sort(
@@ -277,10 +213,9 @@ class KnowledgeBase:
         kb = self.load()
 
         for lesson_id in lessons_shown:
-            if lesson_id in kb.get("lessons", {}):
-                lesson = kb["lessons"][lesson_id]
-                if isinstance(lesson, dict):
-                    lesson["times_prevented"] = lesson.get("times_prevented", 0) + 1
+            if lesson_id in kb["lessons"]:
+                kb["lessons"][lesson_id]["times_prevented"] = \
+                    kb["lessons"][lesson_id].get("times_prevented", 0) + 1
 
         self.save(kb)
 
@@ -288,25 +223,14 @@ class KnowledgeBase:
         """Get knowledge base statistics."""
         kb = self.load()
 
-        lessons = kb.get("lessons", {})
-        total_lessons = len(lessons)
-        total_encounters = sum(
-            l.get("times_encountered", 1) for l in lessons.values() if isinstance(l, dict)
-        )
-        total_prevented = sum(
-            l.get("times_prevented", 0) for l in lessons.values() if isinstance(l, dict)
-        )
+        total_lessons = len(kb["lessons"])
+        total_encounters = sum(l.get("times_encountered", 1) for l in kb["lessons"].values())
+        total_prevented = sum(l.get("times_prevented", 0) for l in kb["lessons"].values())
 
         # By stage
         by_stage = {}
-        for lesson in lessons.values():
-            if not isinstance(lesson, dict):
-                continue
-
-            stage = lesson.get("stage")
-            if not stage:
-                continue
-
+        for lesson in kb["lessons"].values():
+            stage = lesson["stage"]
             if stage not in by_stage:
                 by_stage[stage] = {"lessons": 0, "encounters": 0, "prevented": 0}
             by_stage[stage]["lessons"] += 1
@@ -367,8 +291,8 @@ class KnowledgeBase:
 
     def _find_similar_lesson(self, kb: Dict, error_pattern: str) -> Optional[str]:
         """Find similar existing lesson to avoid duplicates."""
-        for lesson_id, lesson in kb.get("lessons", {}).items():
-            if isinstance(lesson, dict) and lesson.get("error_pattern") == error_pattern:
+        for lesson_id, lesson in kb["lessons"].items():
+            if lesson["error_pattern"] == error_pattern:
                 return lesson_id
         return None
 

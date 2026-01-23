@@ -22,6 +22,7 @@ from .task_decomposer import (
     format_task_for_agent,
     format_tasks_summary,
 )
+from .task_tracker import TaskTrackerManager
 
 
 def log(msg: str) -> None:
@@ -54,6 +55,7 @@ class PipelineRunner:
         self.config_loader = ConfigLoader(project_root)
         self.spawner = ClaudeSpawner(project_root)
         self.knowledge = KnowledgeBase(project_root)
+        self.task_tracker = TaskTrackerManager(project_root)
         self.config: Optional[DevConfig] = None
 
     def _get_knowledge_limit(self, stage_name: str) -> Optional[int]:
@@ -114,6 +116,10 @@ class PipelineRunner:
             log(f"  Story file: {story_file}")
             result.stage_results["create-story"] = "PASS"
 
+            # Initialize task tracking
+            tracker_file = self.task_tracker.initialize(story_id, str(story_file))
+            log(f"  Task tracking: {tracker_file}")
+
             # Step 2: Validate story
             log("\n=== Step 2: Validating story ===")
             passed = self._run_stage("validate", story_id=story_id, story_file=str(story_file))
@@ -140,10 +146,36 @@ class PipelineRunner:
                     passed = self._run_task_by_task_development(story_id, str(story_file), tasks)
                 else:
                     log(f"  Using standard dev-story workflow (only {len(get_incomplete_tasks(tasks))} incomplete tasks)")
+                    # Track main develop stage
+                    self.task_tracker.add_task(
+                        task_id="develop-main",
+                        description="Execute /bmad:bmm:workflows:dev-story",
+                    )
+                    self.task_tracker.update_status("develop-main", "running")
+                    dev_start = time.time()
                     passed = self._run_stage("develop", story_id=story_id, story_file=str(story_file))
+                    dev_duration = time.time() - dev_start
+                    self.task_tracker.update_status(
+                        "develop-main",
+                        "completed" if passed else "failed",
+                        duration_seconds=dev_duration,
+                    )
             else:
                 log("  Task decomposition disabled, using standard dev-story workflow")
+                # Track main develop stage
+                self.task_tracker.add_task(
+                    task_id="develop-main",
+                    description="Execute /bmad:bmm:workflows:dev-story",
+                )
+                self.task_tracker.update_status("develop-main", "running")
+                dev_start = time.time()
                 passed = self._run_stage("develop", story_id=story_id, story_file=str(story_file))
+                dev_duration = time.time() - dev_start
+                self.task_tracker.update_status(
+                    "develop-main",
+                    "completed" if passed else "failed",
+                    duration_seconds=dev_duration,
+                )
 
             result.stage_results["develop"] = "PASS" if passed else "SKIP" if self._is_disabled("develop") else "FAIL"
             if not passed and not self._is_disabled("develop") and self._should_abort("develop"):
@@ -381,6 +413,15 @@ class PipelineRunner:
 
         log(f"  Executing {len(incomplete_tasks)} tasks one-by-one with fresh agents...")
 
+        # Register all tasks with tracker
+        for task in incomplete_tasks:
+            task_preview = task.content.split('\n')[0][:80]
+            self.task_tracker.add_task(
+                task_id=f"task-{task.index}",
+                description=task_preview,
+                task_index=task.index,
+            )
+
         # Get knowledge base limit for develop stage
         limit = self._get_knowledge_limit("develop")
 
@@ -411,6 +452,9 @@ class PipelineRunner:
 
             # Spawn agent for this task
             log(f"  Spawning agent for task #{task.index}...")
+            self.task_tracker.update_status(f"task-{task.index}", "running")
+
+            task_start_time = time.time()
             task_bg = self.spawner.spawn_agent(
                 prompt=full_prompt,
                 background=True,
@@ -419,30 +463,58 @@ class PipelineRunner:
 
             # Wait for task completion
             task_result = self._wait_for_task(task_bg, f"task-{task.index}")
+            task_duration = time.time() - task_start_time
 
             if not task_result.success:
                 log(f"  Task #{task.index} FAILED: {task_result.error[:200] if task_result.error else 'unknown'}...")
+                self.task_tracker.update_status(
+                    f"task-{task.index}",
+                    "failed",
+                    error=task_result.error[:500] if task_result.error else "Unknown error",
+                    duration_seconds=task_duration,
+                )
 
                 # Try to fix with retry
                 stage_config = self.config.stages.get("develop")
                 if stage_config and stage_config.retry and stage_config.retry.max > 0:
                     log(f"  Retrying task #{task.index}...")
+                    attempt = self.task_tracker.increment_attempt(f"task-{task.index}")
+                    self.task_tracker.update_status(f"task-{task.index}", "running")
 
+                    retry_start = time.time()
                     retry_task = self.spawner.spawn_agent(
                         prompt=full_prompt,
                         background=True,
                         task_id_prefix=f"develop-task-{task.index}-retry"
                     )
                     retry_result = self._wait_for_task(retry_task, f"task-{task.index}-retry")
+                    retry_duration = time.time() - retry_start
 
                     if retry_result.success:
                         log(f"  Task #{task.index} PASSED on retry")
+                        self.task_tracker.update_status(
+                            f"task-{task.index}",
+                            "completed",
+                            duration_seconds=retry_duration,
+                        )
                         continue
+                    else:
+                        self.task_tracker.update_status(
+                            f"task-{task.index}",
+                            "failed",
+                            error=retry_result.error[:500] if retry_result.error else "Unknown error",
+                            duration_seconds=retry_duration,
+                        )
 
                 log(f"  Task #{task.index} failed after retry, aborting")
                 return False
 
             log(f"  Task #{task.index} PASSED")
+            self.task_tracker.update_status(
+                f"task-{task.index}",
+                "completed",
+                duration_seconds=task_duration,
+            )
 
             # Track prevention if lessons were shown
             if lessons:
@@ -728,7 +800,24 @@ class PipelineRunner:
                 marker = "✗"
             log(f"  {marker} {stage}: {status}")
 
+        # Print task tracking summary
+        task_summary = self.task_tracker.get_summary()
+        if task_summary and task_summary.get('total_tasks', 0) > 0:
+            log("")
+            log("Sub-Tasks Summary:")
+            log(f"  Total: {task_summary['total_tasks']}")
+            log(f"  Completed: {task_summary['completed']}")
+            log(f"  Failed: {task_summary['failed']}")
+            log(f"  Pending: {task_summary['pending']}")
+            log(f"  Success Rate: {task_summary['success_rate']}")
+            tracker_file = self.task_tracker.get_tracker_file_path()
+            if tracker_file:
+                log(f"  Details: {tracker_file}")
+
         if result.error:
             log(f"\nError: {result.error}")
 
         log("=" * 50)
+
+        # Mark tracking as completed
+        self.task_tracker.mark_completed()

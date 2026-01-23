@@ -121,22 +121,22 @@ After completion, shows:
 Layer 0 is the foundation that other layers build on:
 
 ```
-Layer 0 (/orchestrate-prepare)    ← You are here
+Layer 0 (/orchestrate-prepare)      ← You are here
     │
     └── creates story_id, story_file
             │
             ▼
-Layer 1 (/orchestrate-dev)        ← Uses Layer 0's output
+Layer 1 (/orchestrate-dev)          ← Uses Layer 0's output
     │
     └── develops code
             │
             ▼
-Layer 2 (/orchestrate-pr)         ← Creates PR
+Layer 2 (/orchestrate-integrate)    ← Full dev pipeline + PR + merge
     │
-    └── deploys/merges
+    └── merges to main
             │
             ▼
-Layer 3 (/orchestrate-qa)         ← Runs QA tests
+Layer 3 (/orchestrate-qa)           ← Runs QA tests
 ```
 
 Layer 1+ can call Layer 0 automatically, or you can run Layer 0 standalone to just prepare stories.
