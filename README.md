@@ -2,6 +2,15 @@
 
 A personal Claude Code plugin marketplace for custom skills, hooks, commands, agents, and MCP servers.
 
+## Recent Updates
+
+### January 2026
+- **Code Review Enhancement**: Added file filtering (max 20 files, 100KB each) and graceful cleanup handlers
+- **Task Decomposition**: Auto-detect and process large stories (6+ tasks) task-by-task to prevent context overload
+- **Story Validation**: New validation gate ensures all tasks and acceptance criteria are completed before marking stories done
+- **Layer 0 Added**: New `orchestrate-prepare` skill for story preparation and validation pipeline
+- **SKIP Status**: Support for disabling stages in orchestrate-dev configuration
+
 ## Quick Start
 
 ### Install the Marketplace
@@ -22,7 +31,33 @@ A personal Claude Code plugin marketplace for custom skills, hooks, commands, ag
 
 | Plugin | Version | Description |
 |--------|---------|-------------|
-| [hello-world](plugins) | 1.0.1 | Example plugin demonstrating all component types |
+| [hello-world](plugins) | 1.0.1 | AI development automation with orchestration skills, commands, hooks, and agents |
+
+### Featured Skills
+
+#### Orchestration Skills (AI Development Automation)
+
+| Skill | Layer | Description |
+|-------|-------|-------------|
+| `orchestrate-prepare` | Layer 0 | Story preparation and validation - creates stories from epics and validates readiness |
+| `orchestrate-dev` | Layer 1 | Automated development pipeline with quality gates (lint, typecheck, test, code review) |
+| `orchestrate` | Layer 2 | Full autonomous orchestration - processes stories through complete dev pipeline |
+
+**Recent Improvements:**
+- ✅ Story completion validation gate - ensures all tasks/acceptance criteria are completed
+- ✅ Automatic task decomposition for large stories (6+ tasks)
+- ✅ Automated code review with file filtering (max 20 files, 100KB each)
+- ✅ Graceful cleanup handlers (SIGINT/SIGTERM)
+- ✅ Fix-and-retry logic with configurable retry limits
+- ✅ SKIP status for disabled stages
+- ✅ Layer 0 (orchestrate-prepare) for story preparation pipeline
+
+**Architecture:**
+```
+Layer 0: orchestrate-prepare → Story creation + validation
+Layer 1: orchestrate-dev     → Development + quality checks (lint/test/review)
+Layer 2: orchestrate         → Full autonomous pipeline orchestration
+```
 
 ---
 
@@ -38,17 +73,22 @@ anhnm-claude-marketplace/
 │   ├── validate.js             # Plugin validator
 │   ├── version.js              # Version manager
 │   └── lint-json.js            # JSON linter
-├── plugins/
-│   └── <plugin-name>/
-│       ├── .claude-plugin/
-│       │   └── plugin.json     # Plugin metadata
-│       ├── commands/           # Slash commands
-│       ├── skills/             # Agent skills
-│       ├── hooks/              # Event handlers
-│       ├── agents/             # Specialized agents
-│       ├── .mcp.json           # MCP config (optional)
-│       ├── CHANGELOG.md        # Version history
-│       └── README.md           # Plugin docs
+├── plugins/                    # Plugin components
+│   ├── .claude-plugin/
+│   │   └── plugin.json         # Plugin metadata
+│   ├── commands/               # Slash commands
+│   │   └── greet.md
+│   ├── skills/                 # Agent skills
+│   │   ├── greeting-assistant/
+│   │   ├── orchestrate/        # Layer 2: Full orchestration
+│   │   ├── orchestrate-dev/    # Layer 1: Dev pipeline with quality gates
+│   │   └── orchestrate-prepare/# Layer 0: Story preparation
+│   ├── hooks/                  # Event handlers
+│   │   └── hooks.json
+│   ├── agents/                 # Specialized agents
+│   │   └── greeter.md
+│   ├── CHANGELOG.md            # Version history
+│   └── README.md               # Plugin docs
 ├── docs/
 ├── package.json
 └── README.md
@@ -71,7 +111,7 @@ npm run new-plugin my-plugin "My plugin description"
 ```
 
 This automatically:
-- Creates the plugin directory structure
+- Creates the plugin directory structure at `plugins/my-plugin/`
 - Generates `plugin.json`, `README.md`, `CHANGELOG.md`
 - Creates example files for selected components
 - Registers the plugin in `marketplace.json`
