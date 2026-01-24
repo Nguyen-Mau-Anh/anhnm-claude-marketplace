@@ -125,7 +125,7 @@ stages:
     execution: delegate
     type: layer_call
     delegate_to: "/orchestrate-dev"
-    timeout: 3600  # 1 hour for full Layer 1 execution (prepare + dev + quality) - reduced from 8 hours to catch hangs faster
+    timeout: 28800  # 8 hours for full Layer 1 execution (prepare + dev + quality)
     on_failure: abort
     description: "Execute Layer 1: Story preparation + development + quality checks"
     # This delegates to /orchestrate-dev which will:
@@ -142,7 +142,7 @@ stages:
     enabled: true
     execution: spawn
     type: git_operation
-    timeout: 600
+    timeout: 3600
     on_failure: fix_and_retry
     retry:
       max: 2
@@ -196,7 +196,7 @@ stages:
     enabled: true
     execution: spawn
     type: git_operation
-    timeout: 600
+    timeout: 3600
     on_failure: fix_and_retry
     retry:
       max: 2
@@ -236,7 +236,7 @@ stages:
     enabled: true
     execution: spawn
     type: pr_operation
-    timeout: 600
+    timeout: 3600
     on_failure: fix_and_retry
     retry:
       max: 2
@@ -294,7 +294,7 @@ stages:
     enabled: true
     execution: spawn
     type: pr_operation
-    timeout: 1800                    # 30 minutes max
+    timeout: 10800                    # 3 hours max
     on_failure: fix_and_retry
     retry:
       max: 5                         # Up to 5 fix attempts
@@ -362,7 +362,7 @@ stages:
     execution: spawn
     type: pr_operation
     condition: pr_checks_passed       # Only run if checks passed
-    timeout: 300
+    timeout: 3600
     on_failure: fix_and_retry
     retry:
       max: 1
