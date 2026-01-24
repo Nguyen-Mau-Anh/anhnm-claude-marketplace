@@ -50,11 +50,61 @@ python3 -c "import rich, typer, pydantic, yaml" 2>/dev/null || pip install -q ri
 
 ## How It Works
 
-The Python executor manages the pipeline by spawning isolated Claude agents:
+The Python executor manages the pipeline using a **hierarchical layer architecture**:
 
-1. **SPAWN stages** → Runs `claude --print -p "<prompt>"` as subprocess
-2. **DIRECT stages** → Runs bash commands directly (lint, typecheck, test)
-3. **Fix-and-retry** → On failure, spawns dev agent to fix, then retries
+### Execution Model
+
+1. **DELEGATE stages** → Calls lower layer skills (e.g., `/orchestrate-prepare`)
+2. **SPAWN stages** → Runs `claude --print -p "<prompt>"` as subprocess for BMAD workflows
+3. **DIRECT stages** → Runs bash commands directly (lint, typecheck, test)
+4. **Fix-and-retry** → On failure, spawns dev agent to fix, then retries
+
+### Layer Hierarchy
+
+```
+Layer 1 (/orchestrate-dev)
+    ↓
+    ├── Stage 1: Delegates to /orchestrate-prepare (Layer 0)
+    │       ↓
+    │       ├── create-story (if needed)
+    │       └── validate
+    │
+    └── Stages 3-7: Run directly
+            ├── develop
+            ├── lint
+            ├── typecheck
+            ├── unit-test
+            └── code-review
+```
+
+This ensures:
+- **No code duplication** - Each stage defined once in its layer
+- **True layering** - Layer 1 builds on Layer 0
+- **Composability** - Can run Layer 0 alone or as part of Layer 1
+
+### Auto Task-by-Task Execution
+
+When a story has tasks defined in its `## Tasks / Subtasks` section:
+- **Automatic detection** - System parses story file for incomplete tasks (`- [ ]`)
+- **One agent per task** - Each main task spawns a separate agent
+- **Subtasks included** - Each agent receives the main task + all its indented subtasks
+- **No configuration needed** - Happens automatically when tasks exist
+
+Example story structure:
+```markdown
+## Tasks / Subtasks
+
+- [ ] Implement TimeSlot CRUD endpoints (AC: All)
+  - [ ] POST /api/schedule - Create time slot
+  - [ ] GET /api/schedule - List time slots
+  - [ ] PUT /api/schedule/:id - Update time slot
+
+- [ ] Create ConstraintValidator service (AC: 3, 4)
+  - [ ] isTeacherDoubleBooked() - Check availability
+  - [ ] isRoomDoubleBooked() - Check room availability
+```
+
+Result: **2 agents spawned** (one per main task, each implementing all its subtasks)
 
 ## Configuration
 
@@ -101,7 +151,7 @@ Before marking a story as "Done" or "Ready for Review", developers MUST:
 |---|-------|-----------|------------|
 | 1 | Create Story | SPAWN | Abort |
 | 2 | Validate | SPAWN | Fix + Retry ×2 |
-| 3 | Develop | SPAWN | Fix + Retry ×3 |
+| 3 | Develop | SPAWN (auto task-by-task) | Fix + Retry ×3 |
 | 4 | Lint | DIRECT | Fix + Retry ×2 |
 | 5 | Typecheck | DIRECT | Fix + Retry ×2 |
 | 6 | Unit Test | DIRECT | Fix + Retry ×3 |

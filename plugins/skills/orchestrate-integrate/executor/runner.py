@@ -137,6 +137,20 @@ class PipelineRunner:
                 # Update result with stage outputs
                 self._update_result_from_stage(result, stage_name, stage_result)
 
+                # If this was a delegated layer, extract outputs from the layer's output
+                stage_config = self.config.stages.get(stage_name)
+                if stage_config and stage_config.execution == "delegate":
+                    layer_output = stage_result.get("output", "")
+                    extracted = self._extract_layer_outputs(layer_output)
+
+                    # Update context variables for subsequent stages
+                    if extracted.get("story_id"):
+                        story_id = extracted["story_id"]
+                        result.story_id = story_id
+                    if extracted.get("story_file"):
+                        story_file = Path(extracted["story_file"])
+                        result.story_file = str(story_file)
+
                 # If create-story just ran, update story_id and story_file
                 if stage_name == "create-story":
                     if stage_result.get("story_id"):
@@ -372,9 +386,65 @@ class PipelineRunner:
 
         return {"success": True}
 
+    def _extract_layer_outputs(self, layer_output: str) -> Dict:
+        """
+        Extract story_id and story_file from layer output.
+
+        Looks for patterns like:
+        - "Story ID: 1-2-user-auth"
+        - "Story: 1-2-user-auth"
+        - "Story file: state/stories/1-2-user-auth.md"
+        - "File: state/stories/1-2-user-auth.md"
+        """
+        outputs = {}
+
+        # Try to extract story ID
+        # Pattern 1: "Story ID: <id>"
+        story_id_match = re.search(r'Story ID:\s*(\S+)', layer_output, re.IGNORECASE)
+        if not story_id_match:
+            # Pattern 2: "Story: <id>"
+            story_id_match = re.search(r'Story:\s*(\d+-\d+-[\w-]+)', layer_output)
+
+        if story_id_match:
+            outputs['story_id'] = story_id_match.group(1)
+            log(f"  Extracted story_id: {outputs['story_id']}")
+
+        # Try to extract story file
+        # Pattern 1: "Story file: <path>"
+        story_file_match = re.search(r'Story file:\s*(\S+\.md)', layer_output, re.IGNORECASE)
+        if not story_file_match:
+            # Pattern 2: "File: <path>"
+            story_file_match = re.search(r'File:\s*(\S+\.md)', layer_output)
+
+        if story_file_match:
+            outputs['story_file'] = story_file_match.group(1)
+            log(f"  Extracted story_file: {outputs['story_file']}")
+
+        return outputs
+
     def _execute_stage(self, stage_name: str, stage: StageConfig, **context) -> TaskResult:
-        """Execute a single stage (spawn or direct)."""
-        if stage.execution == "spawn":
+        """Execute a single stage (spawn, direct, or delegate)."""
+        # Handle delegation to another layer
+        if stage.execution == "delegate":
+            if not stage.delegate_to:
+                return TaskResult(
+                    success=False,
+                    output="",
+                    error=f"Stage {stage_name} has execution=delegate but no delegate_to specified",
+                    exit_code=-1
+                )
+
+            # Determine what to pass as story input
+            story_input = context.get("story_id") or context.get("story_file")
+
+            # Delegate to the layer
+            return self.spawner.spawn_layer(
+                layer_skill=stage.delegate_to,
+                story_input=story_input,
+                timeout=stage.timeout
+            )
+
+        elif stage.execution == "spawn":
             return self.spawner.spawn_stage(
                 stage_name=stage_name,
                 timeout=stage.timeout,

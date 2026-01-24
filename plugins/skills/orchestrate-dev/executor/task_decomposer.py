@@ -67,22 +67,21 @@ def parse_story_tasks(story_file: Path) -> List[Task]:
     return tasks
 
 
-def should_decompose(tasks: List[Task], threshold: int = 6) -> bool:
+def should_decompose(tasks: List[Task]) -> bool:
     """
     Determine if story should be decomposed into task-by-task execution.
 
     Args:
         tasks: List of parsed tasks
-        threshold: Number of tasks above which to decompose (default: 6)
 
     Returns:
-        True if story should be decomposed, False otherwise
+        True if story has any incomplete tasks, False otherwise
     """
-    # Don't decompose if already mostly complete
+    # Always decompose if there are any incomplete tasks
     incomplete_tasks = [t for t in tasks if not t.is_complete]
 
-    # Use threshold for incomplete tasks
-    return len(incomplete_tasks) >= threshold
+    # Return True if any incomplete tasks exist
+    return len(incomplete_tasks) > 0
 
 
 def get_incomplete_tasks(tasks: List[Task]) -> List[Task]:

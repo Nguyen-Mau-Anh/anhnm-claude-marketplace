@@ -58,25 +58,47 @@ python3 -c "import rich, typer, pydantic, yaml" 2>/dev/null || pip install -q ri
 
 ## How It Works
 
-The Python executor runs a complete 12-stage pipeline with knowledge-based learning:
+The Python executor runs a complete integration pipeline using a **hierarchical layer architecture**:
 
-**Layer 0 Stages (Story Preparation):**
-1. **create-story** → Auto-detect or create story from epics
-2. **validate** → Validate story readiness with auto-fix retry
+### Execution Model
 
-**Layer 1 Stages (Development & Quality):**
-3. **develop** → Implement story following TDD
-4. **lint** → Run lint checks with auto-fix
-5. **typecheck** → Run TypeScript type checking with auto-fix
-6. **unit-test** → Run unit tests with auto-fix
-7. **code-review** → AI code review (non-blocking)
+1. **DELEGATE stages** → Calls lower layer skills (e.g., `/orchestrate-dev`)
+2. **SPAWN stages** → Runs `claude --print -p "<prompt>"` as subprocess for BMAD workflows and git operations
+3. **DIRECT stages** → Runs bash commands directly
+4. **Fix-and-retry** → On failure, spawns fix agent, then retries
 
-**Layer 2 Stages (Integration & Deployment):**
-8. **git-commit** → Create commit with AI-generated message
-9. **git-push** → Push to remote feature branch
-10. **pr-create** → Create PR with AI-generated description
-11. **pr-checks** → Monitor CI/CD, auto-fix failures (loop until pass)
-12. **pr-merge** → Merge PR (configurable: auto or manual)
+### Layer Hierarchy
+
+```
+Layer 2 (/orchestrate-integrate)
+    ↓
+    ├── Stage 1: Delegates to /orchestrate-dev (Layer 1)
+    │       ↓
+    │       ├── Stage 1: Delegates to /orchestrate-prepare (Layer 0)
+    │       │       ↓
+    │       │       ├── create-story
+    │       │       └── validate
+    │       │
+    │       └── Stages 3-7: Run directly
+    │               ├── develop
+    │               ├── lint
+    │               ├── typecheck
+    │               ├── unit-test
+    │               └── code-review
+    │
+    └── Stages 8-12: Run directly (Layer 2 specific)
+            ├── git-commit
+            ├── git-push
+            ├── pr-create
+            ├── pr-checks
+            └── pr-merge
+```
+
+**Benefits of Hierarchical Design:**
+- **No code duplication** - Stages 1-7 defined once in lower layers
+- **True layering** - Each layer builds on previous layers
+- **Composability** - Can run any layer independently
+- **Single source of truth** - Each stage maintained in one place
 
 ## Configuration
 
@@ -123,7 +145,7 @@ stages:
 |---|-------|-----------|------------|-------|
 | 1 | Create Story | SPAWN | Abort | 0 |
 | 2 | Validate | SPAWN | Fix + Retry ×2 | 0 |
-| 3 | Develop | SPAWN | Fix + Retry ×2 | 1 |
+| 3 | Develop | SPAWN (auto task-by-task) | Fix + Retry ×2 | 1 |
 | 4 | Lint | SPAWN | Fix + Retry ×3 | 1 |
 | 5 | TypeCheck | DIRECT | Fix + Retry ×3 | 1 |
 | 6 | Unit Test | DIRECT | Fix + Retry ×3 | 1 |

@@ -18,10 +18,11 @@ class StageConfig(BaseModel):
     """Configuration for a single stage."""
     order: float = 0
     enabled: bool = True
-    execution: str = "spawn"  # "spawn" or "direct"
+    execution: str = "spawn"  # "spawn", "direct", or "delegate"
     type: str = "bmad_workflow"
     workflow: Optional[str] = None
     command: Optional[str] = None
+    delegate_to: Optional[str] = None  # For execution="delegate": skill to call (e.g., "/orchestrate-dev")
     condition: Optional[str] = None
     timeout: int = 300
     on_failure: str = "abort"
@@ -37,12 +38,6 @@ class KnowledgeBaseConfig(BaseModel):
     max_lessons_per_stage: Optional[int] = None
     min_encounter_count: int = 1
     stage_overrides: Optional[Dict[str, Dict[str, int]]] = Field(default_factory=dict)
-
-
-class TaskDecompositionConfig(BaseModel):
-    """Configuration for task decomposition."""
-    enabled: bool = True
-    threshold: int = 6
 
 
 class PRSettingsConfig(BaseModel):
@@ -92,7 +87,6 @@ Do not ask follow-up questions."""
 
     # From Layer 1
     knowledge_base: KnowledgeBaseConfig = Field(default_factory=KnowledgeBaseConfig)
-    task_decomposition: TaskDecompositionConfig = Field(default_factory=TaskDecompositionConfig)
 
     # Layer 2 specific
     pr_settings: PRSettingsConfig = Field(default_factory=PRSettingsConfig)
@@ -148,11 +142,6 @@ class ConfigLoader:
         if "knowledge_base" in data and isinstance(data["knowledge_base"], dict):
             kb_config = KnowledgeBaseConfig(**data["knowledge_base"])
 
-        # Parse task_decomposition config
-        td_config = TaskDecompositionConfig()
-        if "task_decomposition" in data and isinstance(data["task_decomposition"], dict):
-            td_config = TaskDecompositionConfig(**data["task_decomposition"])
-
         # Parse PR settings
         pr_config = PRSettingsConfig()
         if "pr_settings" in data and isinstance(data["pr_settings"], dict):
@@ -173,7 +162,6 @@ class ConfigLoader:
             stages=stages,
             output=data.get("output", []),
             knowledge_base=kb_config,
-            task_decomposition=td_config,
             pr_settings=pr_config,
             git_settings=git_config,
         )
