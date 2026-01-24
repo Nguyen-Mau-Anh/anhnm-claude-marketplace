@@ -37,6 +37,20 @@ autonomy_instructions: |
   Execute the task completely and output results only.
   Do not ask follow-up questions.
 
+# Health Monitoring Configuration
+# Controls subprocess health checks to detect hung processes
+health_monitoring:
+  enabled: true
+  activity_timeout: 1200              # Seconds without output before killing (20 min - allows for long AI thinking)
+  health_check_interval: 10           # How often to check health (seconds)
+  use_cpu_detection: true             # If true, don't kill if process is using CPU (indicates it's working)
+  critical_error_patterns:            # Error patterns that trigger immediate kill
+    - "Error: No messages returned"
+    - "API request failed"
+    - "Connection refused"
+    - "ECONNREFUSED"
+    - "Request timeout"
+
 # Story file locations to check (in order)
 story_locations:
   - "state/stories/${story_id}.md"
@@ -111,7 +125,7 @@ stages:
     execution: delegate
     type: layer_call
     delegate_to: "/orchestrate-dev"
-    timeout: 28800  # 8 hours for full Layer 1 execution (prepare + dev + quality)
+    timeout: 3600  # 1 hour for full Layer 1 execution (prepare + dev + quality) - reduced from 8 hours to catch hangs faster
     on_failure: abort
     description: "Execute Layer 1: Story preparation + development + quality checks"
     # This delegates to /orchestrate-dev which will:

@@ -48,7 +48,6 @@ class DevConfig(BaseModel):
     description: str = "Story development with quality checks"
     layer: int = 1
 
-    # Autonomy instructions injected into all prompts via {autonomy}
     autonomy_instructions: str = """AUTONOMOUS MODE - NO QUESTIONS.
 Skip all menus, confirmations, and user prompts.
 Execute the task completely and output results only.
@@ -68,7 +67,6 @@ Do not ask follow-up questions."""
         "review_findings", "status"
     ])
 
-    # Knowledge base configuration
     knowledge_base: KnowledgeBaseConfig = Field(default_factory=KnowledgeBaseConfig)
 
 

@@ -152,6 +152,9 @@ class TaskTrackerManager:
 
                 if status == "running":
                     task['started_at'] = self._now()
+                    # Clear completed_at when restarting (for retries)
+                    task['completed_at'] = None
+                    task['duration_seconds'] = None
                 elif status in ("completed", "failed"):
                     task['completed_at'] = self._now()
                     if duration_seconds is not None:

@@ -21,8 +21,26 @@ console = Console()
 
 
 def get_project_root() -> Path:
-    """Get the project root directory."""
-    return Path.cwd()
+    """
+    Get the project root directory.
+
+    Handles the case where we're running from inside .claude/skills/orchestrate-dev
+    when called via subprocess delegation from Layer 2.
+    """
+    cwd = Path.cwd()
+
+    # Check if we're inside .claude/skills/ directory
+    # If so, go up to find the actual project root
+    parts = cwd.parts
+    if '.claude' in parts and 'skills' in parts:
+        # Find the index of .claude
+        claude_idx = parts.index('.claude')
+        # Project root is the parent of .claude
+        project_root = Path(*parts[:claude_idx])
+        return project_root
+
+    # Otherwise, cwd is the project root
+    return cwd
 
 
 def cleanup_and_exit(signum=None, frame=None):

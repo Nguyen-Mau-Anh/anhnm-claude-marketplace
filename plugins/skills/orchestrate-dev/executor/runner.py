@@ -58,6 +58,8 @@ class PipelineRunner:
         self.knowledge = KnowledgeBase(project_root)
         self.task_tracker = TaskTrackerManager(project_root)
         self.config: Optional[DevConfig] = None
+        self.story_id: Optional[str] = None
+        self.story_file: Optional[Path] = None
 
     def _get_knowledge_limit(self, stage_name: str) -> Optional[int]:
         """
@@ -102,20 +104,50 @@ class PipelineRunner:
             self.spawner.set_config(self.config)
             log("  Config loaded successfully")
 
-            # Step 1: Determine story
-            log("\n=== Step 1: Determining story ===")
-            story_id, story_file = self._resolve_story(story_id)
-            result.story_id = story_id
-            result.story_file = str(story_file) if story_file else None
+            # Step 1: Resolve story (check if exists, delegate to Layer 0 if needed)
+            log("\n=== Step 1: Resolving story ===")
 
+            # Check if story file exists
+            story_file = None
+            if story_id:
+                story_file = self.config_loader.find_story_file(story_id, self.config)
+                if story_file:
+                    log(f"  ✓ Story file found: {story_file}")
+                else:
+                    log(f"  Story file not found for ID: {story_id}")
+
+            # If no story file, delegate to Layer 0 for story preparation
             if not story_file:
-                result.error = "Failed to create or find story file"
-                log(f"  ERROR: {result.error}")
-                return result
+                log("  Delegating to Layer 0 for story preparation...")
+
+                # Run layer-0-execution stage (delegates to /orchestrate-prepare)
+                success = self._run_stage("layer-0-execution", story_id=story_id)
+
+                if not success:
+                    result.error = "Layer 0 (story preparation) failed"
+                    log(f"  ✗ {result.error}")
+                    return result
+
+                # After Layer 0, we should have story_id and story_file set by delegation
+                story_id = self.story_id
+                story_file = self.story_file
+
+                if not story_file or not story_file.exists():
+                    result.error = "Layer 0 completed but no story file created"
+                    log(f"  ✗ {result.error}")
+                    return result
+
+                log(f"  ✓ Layer 0 complete")
+                result.stage_results["layer-0-execution"] = "PASS"
+
+            # Store story info
+            self.story_id = story_id
+            self.story_file = story_file
+            result.story_id = story_id
+            result.story_file = str(story_file)
 
             log(f"  Story ID: {story_id}")
             log(f"  Story file: {story_file}")
-            result.stage_results["create-story"] = "PASS"
 
             # Initialize task tracking
             tracker_file = self.task_tracker.initialize(story_id, str(story_file))
@@ -140,6 +172,14 @@ class PipelineRunner:
             if should_decompose(tasks):
                 log(f"  Using task-by-task execution ({len(get_incomplete_tasks(tasks))} incomplete tasks found)")
                 passed = self._run_task_by_task_development(story_id, str(story_file), tasks)
+
+                # Task-by-task handles retries internally, so if it returns False, always abort
+                # This prevents parallel execution when tasks fail
+                result.stage_results["develop"] = "PASS" if passed else "FAIL"
+                if not passed and not self._is_disabled("develop"):
+                    result.error = "Development failed (task-by-task execution)"
+                    log(f"  [CRITICAL] Task-by-task development failed, aborting pipeline")
+                    return result
             else:
                 log(f"  Using standard dev-story workflow (no incomplete tasks found)")
                 # Track main develop stage
@@ -157,10 +197,11 @@ class PipelineRunner:
                     duration_seconds=dev_duration,
                 )
 
-            result.stage_results["develop"] = "PASS" if passed else "SKIP" if self._is_disabled("develop") else "FAIL"
-            if not passed and not self._is_disabled("develop") and self._should_abort("develop"):
-                result.error = "Development failed"
-                return result
+                # For standard execution, respect on_failure setting
+                result.stage_results["develop"] = "PASS" if passed else "SKIP" if self._is_disabled("develop") else "FAIL"
+                if not passed and not self._is_disabled("develop") and self._should_abort("develop"):
+                    result.error = "Development failed"
+                    return result
 
             # Step 3.5: Validate story completion (CRITICAL GATE)
             log("\n=== Step 3.5: Validating story completion ===")
@@ -307,6 +348,8 @@ class PipelineRunner:
         """
         Run a stage by delegating to another layer skill.
 
+        REFACTORED: Uses direct Python import instead of subprocess for reliability.
+
         Returns:
             bool: True if delegation succeeded
         """
@@ -321,12 +364,17 @@ class PipelineRunner:
         # Determine what to pass as story input
         story_input = kwargs.get("story_id") or kwargs.get("story_file")
 
-        # Call the spawner's spawn_layer method
-        result = self.spawner.spawn_layer(
-            layer_skill=layer_skill,
-            story_input=story_input,
-            timeout=stage_config.timeout
-        )
+        # REFACTORED: Direct Python import for /orchestrate-prepare
+        if layer_skill == "/orchestrate-prepare":
+            result = self._delegate_to_layer0(story_input, stage_config.timeout)
+        else:
+            # Fallback to subprocess for unknown layers
+            log(f"  Using subprocess delegation for {layer_skill}")
+            result = self.spawner.spawn_layer(
+                layer_skill=layer_skill,
+                story_input=story_input,
+                timeout=stage_config.timeout
+            )
 
         if result.success:
             log(f"  ✓ Layer {layer_skill} succeeded")
@@ -347,6 +395,110 @@ class PipelineRunner:
         else:
             log(f"  ✗ Layer {layer_skill} failed: {result.error}")
             return False
+
+    def _delegate_to_layer0(self, story_input: Optional[str], timeout: int) -> TaskResult:
+        """
+        Delegate to Layer 0 by calling Python executor directly (NOT via Claude CLI).
+
+        Bypasses unreliable Claude CLI and calls Python executor directly.
+        """
+        log(f"    Delegating to Layer 0 (direct Python executor)")
+        if story_input:
+            log(f"    Story input: {story_input}")
+
+        start_time = time.time()
+
+        try:
+            # Build command to run Layer 0 Python executor directly
+            layer0_path = self.project_root / ".claude" / "skills" / "orchestrate-prepare"
+
+            # Check if Layer 0 exists
+            if not layer0_path.exists():
+                return TaskResult(
+                    success=False,
+                    output="",
+                    error=f"Layer 0 not found at: {layer0_path}\nPlease install orchestrate-prepare skill.",
+                    exit_code=-1,
+                    duration_seconds=0,
+                )
+
+            # Command: python3 -m executor [story_input]
+            cmd = ["python3", "-m", "executor"]
+            if story_input:
+                cmd.append(story_input)
+
+            # Run with proper timeout and capture output
+            result = subprocess.run(
+                cmd,
+                cwd=str(layer0_path),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env={**subprocess.os.environ, "PYTHONPATH": str(layer0_path)}
+            )
+
+            duration = time.time() - start_time
+
+            # Check result
+            if result.returncode == 0:
+                # Success
+                output_lines = [
+                    f"✓ Layer 0 complete ({duration:.1f}s)",
+                ]
+
+                # Try to extract story info from output
+                if "Story ID:" in result.stdout:
+                    for line in result.stdout.split('\n'):
+                        if "Story ID:" in line or "Story file:" in line:
+                            output_lines.append(f"    {line.strip()}")
+
+                return TaskResult(
+                    success=True,
+                    output="\n".join(output_lines),
+                    error=None,
+                    exit_code=0,
+                    duration_seconds=duration,
+                )
+            else:
+                # Failure
+                error_msg = f"Layer 0 failed with exit code {result.returncode}"
+                if result.stderr:
+                    error_msg += f"\nStderr: {result.stderr}"
+
+                return TaskResult(
+                    success=False,
+                    output=result.stdout or "",
+                    error=error_msg,
+                    exit_code=result.returncode,
+                    duration_seconds=duration,
+                )
+
+        except subprocess.TimeoutExpired as e:
+            duration = time.time() - start_time
+            log(f"  ✗ Layer 0 timed out after {timeout}s")
+
+            return TaskResult(
+                success=False,
+                output=e.stdout.decode() if e.stdout else "",
+                error=f"Layer 0 timed out after {timeout}s",
+                exit_code=-1,
+                duration_seconds=duration,
+                status=TaskStatus.TIMEOUT,
+            )
+
+        except Exception as e:
+            duration = time.time() - start_time
+            log(f"  ✗ Layer 0 delegation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+            return TaskResult(
+                success=False,
+                output="",
+                error=f"Layer 0 delegation error: {str(e)}",
+                exit_code=-1,
+                duration_seconds=duration,
+            )
 
     def _wait_for_task(
         self,

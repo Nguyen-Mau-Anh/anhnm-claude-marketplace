@@ -1,4 +1,4 @@
-"""Configuration loader for orchestrate-integrate Layer 2."""
+"""Configuration loader for Layer 2 - orchestrate-integrate."""
 
 import yaml
 import shutil
@@ -18,11 +18,11 @@ class StageConfig(BaseModel):
     """Configuration for a single stage."""
     order: float = 0
     enabled: bool = True
-    execution: str = "spawn"  # "spawn", "direct", or "delegate"
+    execution: str = "spawn"
     type: str = "bmad_workflow"
     workflow: Optional[str] = None
     command: Optional[str] = None
-    delegate_to: Optional[str] = None  # For execution="delegate": skill to call (e.g., "/orchestrate-dev")
+    delegate_to: Optional[str] = None
     condition: Optional[str] = None
     timeout: int = 300
     on_failure: str = "abort"
@@ -33,33 +33,30 @@ class StageConfig(BaseModel):
 
 
 class KnowledgeBaseConfig(BaseModel):
-    """Configuration for knowledge base system."""
+    """Knowledge base configuration."""
     enabled: bool = True
     max_lessons_per_stage: Optional[int] = None
     min_encounter_count: int = 1
     stage_overrides: Optional[Dict[str, Dict[str, int]]] = Field(default_factory=dict)
 
 
-class PRSettingsConfig(BaseModel):
-    """PR settings for Layer 2."""
-    auto_merge: bool = False
-    merge_method: str = "squash"  # "squash", "merge", "rebase"
+class PRSettings(BaseModel):
+    """PR settings."""
+    auto_merge: bool = True
+    merge_method: str = "squash"
     delete_branch_after_merge: bool = True
-    require_reviews: int = 0
-    wait_for_checks: bool = True
-    title_template: str = "feat: {story_title}"
-    description_template: str = "## Story\n{story_id}: {story_title}\n\n{changes_summary}"
+    require_ci_pass: bool = True
+    ci_timeout: int = 7200
 
 
-class GitSettingsConfig(BaseModel):
-    """Git settings for Layer 2."""
-    branch_prefix: str = "feat/"
+class GitSettings(BaseModel):
+    """Git settings."""
     base_branch: str = "main"
-    commit_message_template: str = "{commit_type}: {story_title}\n\nStory: {story_id}\n\n{changes_summary}"
+    branch_prefix: str = "story"
 
 
 class IntegrateConfig(BaseModel):
-    """Layer 2 configuration model (extends Layer 1)."""
+    """Layer 2 configuration model."""
     name: str = "orchestrate-integrate"
     version: str = "1.0.0"
     description: str = "Complete integration pipeline"
@@ -78,19 +75,14 @@ Do not ask follow-up questions."""
 
     stages: Dict[str, StageConfig] = Field(default_factory=dict)
 
-    output: List[str] = Field(default_factory=lambda: [
-        "story_id", "story_file", "files_changed",
-        "lint_result", "typecheck_result", "test_results",
-        "review_findings", "commit_hash", "branch_name",
-        "pr_number", "pr_url", "pr_status", "merge_status", "status"
-    ])
-
-    # From Layer 1
     knowledge_base: KnowledgeBaseConfig = Field(default_factory=KnowledgeBaseConfig)
+    pr_settings: PRSettings = Field(default_factory=PRSettings)
+    git_settings: GitSettings = Field(default_factory=GitSettings)
 
-    # Layer 2 specific
-    pr_settings: PRSettingsConfig = Field(default_factory=PRSettingsConfig)
-    git_settings: GitSettingsConfig = Field(default_factory=GitSettingsConfig)
+    output: List[str] = Field(default_factory=lambda: [
+        "story_id", "story_file", "pr_url", "pr_status",
+        "lessons_saved", "errors_prevented", "status"
+    ])
 
 
 class ConfigLoader:
@@ -137,20 +129,18 @@ class ConfigLoader:
                         stage_data["retry"] = RetryConfig(**stage_data["retry"])
                     stages[name] = StageConfig(**stage_data)
 
-        # Parse knowledge_base config
+        # Parse nested configs
         kb_config = KnowledgeBaseConfig()
         if "knowledge_base" in data and isinstance(data["knowledge_base"], dict):
             kb_config = KnowledgeBaseConfig(**data["knowledge_base"])
 
-        # Parse PR settings
-        pr_config = PRSettingsConfig()
+        pr_settings = PRSettings()
         if "pr_settings" in data and isinstance(data["pr_settings"], dict):
-            pr_config = PRSettingsConfig(**data["pr_settings"])
+            pr_settings = PRSettings(**data["pr_settings"])
 
-        # Parse Git settings
-        git_config = GitSettingsConfig()
+        git_settings = GitSettings()
         if "git_settings" in data and isinstance(data["git_settings"], dict):
-            git_config = GitSettingsConfig(**data["git_settings"])
+            git_settings = GitSettings(**data["git_settings"])
 
         return IntegrateConfig(
             name=data.get("name", "orchestrate-integrate"),
@@ -160,10 +150,10 @@ class ConfigLoader:
             autonomy_instructions=data.get("autonomy_instructions", IntegrateConfig.model_fields["autonomy_instructions"].default),
             story_locations=data.get("story_locations", []),
             stages=stages,
-            output=data.get("output", []),
             knowledge_base=kb_config,
-            pr_settings=pr_config,
-            git_settings=git_config,
+            pr_settings=pr_settings,
+            git_settings=git_settings,
+            output=data.get("output", []),
         )
 
     def find_story_file(self, story_id: str, config: IntegrateConfig) -> Optional[Path]:
