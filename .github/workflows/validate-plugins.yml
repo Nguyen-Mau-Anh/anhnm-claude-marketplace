@@ -24,29 +24,45 @@ jobs:
 
       - name: Validate plugin structure
         run: |
-          for plugin_dir in plugins/*/; do
-            plugin_name=$(basename "$plugin_dir")
-            echo "Validating plugin: $plugin_name"
+          # Read plugin paths from marketplace.json (source of truth)
+          # This handles both nested (plugins/plugin-name/) and flattened (plugins/) structures
+          python3 << 'EOF'
+          import json
+          import os
+          import sys
 
-            # Check plugin.json exists
-            if [ ! -f "${plugin_dir}.claude-plugin/plugin.json" ]; then
-              echo "Error: ${plugin_dir}.claude-plugin/plugin.json not found"
-              exit 1
-            fi
+          with open('.claude-plugin/marketplace.json') as f:
+              data = json.load(f)
 
-            # Validate plugin.json is valid JSON
-            cat "${plugin_dir}.claude-plugin/plugin.json" | python3 -m json.tool > /dev/null
-            echo "  - plugin.json is valid"
+          for plugin in data['plugins']:
+              plugin_name = plugin['name']
+              plugin_path = plugin['path']
+              print(f"Validating plugin: {plugin_name} (path: {plugin_path})")
 
-            # Check for README
-            if [ -f "${plugin_dir}README.md" ]; then
-              echo "  - README.md exists"
-            else
-              echo "  - Warning: README.md not found"
-            fi
+              # Check plugin.json exists
+              plugin_json = f"{plugin_path}/.claude-plugin/plugin.json"
+              if not os.path.exists(plugin_json):
+                  print(f"Error: {plugin_json} not found")
+                  sys.exit(1)
 
-            echo "  Plugin $plugin_name validated successfully"
-          done
+              # Validate plugin.json is valid JSON
+              try:
+                  with open(plugin_json) as pf:
+                      json.load(pf)
+                  print("  - plugin.json is valid")
+              except json.JSONDecodeError as e:
+                  print(f"  - Error: plugin.json is invalid JSON: {e}")
+                  sys.exit(1)
+
+              # Check for README
+              readme_path = f"{plugin_path}/README.md"
+              if os.path.exists(readme_path):
+                  print("  - README.md exists")
+              else:
+                  print("  - Warning: README.md not found")
+
+              print(f"  Plugin {plugin_name} validated successfully")
+          EOF
 
       - name: Check for required files
         run: |
