@@ -108,7 +108,7 @@ stages:
     enabled: true
     execution: spawn
     type: lint_check
-    timeout: 3600
+    timeout: 7200
     on_failure: fix_and_retry
     retry:
       max: 3
@@ -191,7 +191,7 @@ stages:
     execution: direct
     type: bash
     command: "npm run typecheck"
-    timeout: 3600
+    timeout: 7200
     on_failure: fix_and_retry
     retry:
       max: 2
@@ -234,7 +234,7 @@ stages:
     execution: direct
     type: bash
     command: "npm test"
-    timeout: 3600
+    timeout: 7200
     on_failure: fix_and_retry
     retry:
       max: 3
@@ -276,7 +276,7 @@ stages:
     execution: spawn
     type: bmad_workflow
     workflow: /bmad:bmm:workflows:code-review
-    timeout: 3600
+    timeout: 10800
     on_failure: continue
     blocking: false
     description: "Review code quality, security, and architecture"
