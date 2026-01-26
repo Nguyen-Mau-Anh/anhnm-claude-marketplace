@@ -30,9 +30,9 @@ autonomy_instructions: |
 
 # Story file locations to check (in order)
 story_locations:
-  - "state/stories/${story_id}.md"
-  - "docs/stories/${story_id}.md"
   - "docs/sprint-artifacts/${story_id}.md"
+  - "docs/stories/${story_id}.md"
+  - "state/stories/${story_id}.md"
 
 # Knowledge Base Configuration
 # Controls how lessons learned are captured and applied
@@ -108,7 +108,7 @@ stages:
     enabled: true
     execution: spawn
     type: lint_check
-    timeout: 7200
+    timeout: 3600
     on_failure: fix_and_retry
     retry:
       max: 3
@@ -191,7 +191,7 @@ stages:
     execution: direct
     type: bash
     command: "npm run typecheck"
-    timeout: 7200
+    timeout: 3600
     on_failure: fix_and_retry
     retry:
       max: 2
@@ -234,7 +234,7 @@ stages:
     execution: direct
     type: bash
     command: "npm test"
-    timeout: 7200
+    timeout: 3600
     on_failure: fix_and_retry
     retry:
       max: 3
@@ -276,7 +276,7 @@ stages:
     execution: spawn
     type: bmad_workflow
     workflow: /bmad:bmm:workflows:code-review
-    timeout: 10800
+    timeout: 3600
     on_failure: continue
     blocking: false
     description: "Review code quality, security, and architecture"

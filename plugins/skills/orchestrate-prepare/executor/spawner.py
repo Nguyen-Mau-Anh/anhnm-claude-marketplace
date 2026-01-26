@@ -152,6 +152,7 @@ class ClaudeSpawner:
         return [
             "claude",
             "--print",
+            "--model", "sonnet",
             "--permission-mode", "bypassPermissions",
             "--no-session-persistence",
             "--output-format", "text",  # Ensure plain text output

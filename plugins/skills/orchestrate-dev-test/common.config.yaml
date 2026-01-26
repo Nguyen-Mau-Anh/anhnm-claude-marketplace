@@ -1,0 +1,56 @@
+# Common Orchestrate Configuration
+# =================================
+# Shared settings used by all orchestration layers
+
+# Story file locations to check (in order)
+story_locations:
+  - "state/stories/${story_id}.md"
+  - "docs/stories/${story_id}.md"
+  - "docs/sprint-artifacts/${story_id}.md"
+
+# Git settings
+git:
+  base_branch: "main"
+  branch_prefix: "story"
+  auto_commit: true
+
+# PR settings (used by Layer 3)
+pr:
+  auto_merge: true
+  merge_method: "squash"
+  delete_branch_after_merge: true
+  require_ci_pass: true
+  ci_timeout: 7200
+
+# Knowledge Base Configuration
+knowledge_base:
+  enabled: true
+  max_lessons_per_stage: null
+  min_encounter_count: 1
+
+# Default timeouts (seconds)
+timeouts:
+  layer_call: 7200
+  story_creation: 3600
+  development: 21600
+  test_design: 1800
+  deployment: 600
+  test_execution: 1800
+
+# Default retry settings
+retry:
+  max_attempts: 3
+  on_failure: "abort"
+
+# Autonomy instructions
+autonomy_instructions: |
+  AUTONOMOUS MODE - NO QUESTIONS.
+  Skip all menus, confirmations, and user prompts.
+  Execute the task completely and output results only.
+  Do not ask follow-up questions.
+
+# Health monitoring
+health_monitoring:
+  enabled: true
+  activity_timeout: 1200
+  health_check_interval: 10

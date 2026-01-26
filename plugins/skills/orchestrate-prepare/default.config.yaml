@@ -28,9 +28,9 @@ autonomy_instructions: |
 
 # Story file locations to check (in order)
 story_locations:
-  - "state/stories/${story_id}.md"
-  - "docs/stories/${story_id}.md"
   - "docs/sprint-artifacts/${story_id}.md"
+  - "docs/stories/${story_id}.md"
+  - "state/stories/${story_id}.md"
 
 # Input parameters
 input:

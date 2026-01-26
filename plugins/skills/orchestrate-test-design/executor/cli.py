@@ -1,4 +1,4 @@
-"""CLI interface for orchestrate-dev Layer 1."""
+"""CLI interface for orchestrate-test-design."""
 
 import typer
 import signal
@@ -7,14 +7,14 @@ from pathlib import Path
 from typing import Optional
 from rich.console import Console
 
-from .runner import PipelineRunner
+from .runner import TestDesignRunner
 
 # Global runner instance for cleanup
 _runner_instance = None
 
 app = typer.Typer(
-    name="orchestrate-dev",
-    help="Layer 1: Story development with quality checks",
+    name="orchestrate-test-design",
+    help="Test Design Track: TDM creation, test case generation, validation",
     invoke_without_command=True,
 )
 console = Console()
@@ -82,19 +82,18 @@ def cleanup_and_exit(signum=None, frame=None):
 
 
 @app.callback(invoke_without_command=True)
-def run_pipeline(
+def run_test_design(
     ctx: typer.Context,
-    story_id: Optional[str] = typer.Argument(
-        None,
-        help="Story ID to develop (runs next story from backlog if not provided)"
+    story_id: str = typer.Argument(
+        ...,
+        help="Story ID to create test design for"
     ),
 ):
     """
-    Layer 1: Story development with quality checks.
+    Test Design Track: Create TDM and generate test cases.
 
     Usage:
-        /orchestrate-dev                  # Run next story from backlog
-        /orchestrate-dev 1-2-user-auth    # Run specific story
+        /orchestrate-test-design 1-2-user-auth
     """
     # Skip if a subcommand was invoked
     if ctx.invoked_subcommand is not None:
@@ -107,15 +106,12 @@ def run_pipeline(
     signal.signal(signal.SIGTERM, cleanup_and_exit)  # Termination
 
     project_root = get_project_root()
-    runner = PipelineRunner(project_root)
+    runner = TestDesignRunner(project_root)
     _runner_instance = runner  # Store for cleanup
 
-    console.print(f"\n[bold]Orchestrate Dev - Layer 1[/bold]")
+    console.print(f"\n[bold]Orchestrate Test Design[/bold]")
     console.print(f"Project: {project_root.name}")
-    if story_id:
-        console.print(f"Story: {story_id}")
-    else:
-        console.print("Story: (next from backlog)")
+    console.print(f"Story: {story_id}")
     console.print("=" * 50)
 
     try:
@@ -125,10 +121,11 @@ def run_pipeline(
         cleanup_and_exit()
 
         if result.success:
-            console.print(f"\n[bold green]Pipeline completed successfully![/bold green]")
+            console.print(f"\n[bold green]Test design completed successfully![/bold green]")
+            console.print(f"TDM: {result.tdm_file}")
             raise typer.Exit(0)
         else:
-            console.print(f"\n[bold red]Pipeline failed: {result.error}[/bold red]")
+            console.print(f"\n[bold red]Test design failed: {result.error}[/bold red]")
             raise typer.Exit(1)
 
     except KeyboardInterrupt:

@@ -1,0 +1,438 @@
+# Orchestrate Dev Test - Layer 2 Configuration
+# =============================================
+# L2 orchestrator that wraps L1 and adds parallel test design + test execution.
+#
+# This file is auto-copied to docs/orchestrate-dev-test.config.yaml on first run.
+# Customize the copy in docs/ folder for your project.
+#
+# Prompt Variables (for spawn stages):
+#   {story_id}      - The story identifier
+#   {story_file}    - Path to story file
+#   {tdm_file}      - Path to TDM file
+#   {test_output}   - Test output/errors
+#   {deploy_url}    - Deployed application URL
+#   {autonomy}      - Auto-injected autonomy instructions
+#   {project_root}  - Absolute path to project root directory
+
+name: orchestrate-dev-test
+version: "1.0.0"
+description: "Layer 2: Development + parallel test design + test execution"
+layer: 2
+wraps: orchestrate-dev
+
+# Autonomy instructions
+autonomy_instructions: |
+  AUTONOMOUS MODE - NO QUESTIONS.
+  Skip all menus, confirmations, and user prompts.
+  Execute the task completely and output results only.
+  Do not ask follow-up questions.
+
+# Story file locations
+story_locations:
+  - "docs/sprint-artifacts/${story_id}.md"
+  - "docs/stories/${story_id}.md"
+  - "state/stories/${story_id}.md"
+
+# Story type filtering - which stories require/skip tests
+story_types:
+  skip:
+    - environment-setup
+    - documentation
+    - config-change
+    - dependency-update
+    - infrastructure
+  require:
+    - feature
+    - bugfix
+    - refactor
+    - api-change
+    - security
+
+# Deployment settings
+deployment:
+  enabled: true
+  health_check_timeout: 60
+  methods:
+    local:
+      - "docker-compose up -d"
+      - "npm run start"
+      - "make run"
+    cloud:
+      - "vercel deploy --prebuilt"
+      - "serverless deploy --stage dev"
+
+# Test execution settings
+test_execution:
+  smoke:
+    command: "npm run test:smoke"
+    timeout: 600
+    required: true
+  critical_sqa:
+    command: "npm run test:sqa:critical"
+    timeout: 900
+    required: true
+  max_fix_attempts: 3
+
+# Test Artifacts Organization
+# All test-related files for a story are organized in: docs/test-artifacts/{story-id}/
+#
+# Structure:
+#   docs/test-artifacts/{story-id}/
+#   ├── design/
+#   │   ├── tdm.yaml                    # Test Design Matrix
+#   │   └── test-cases.yaml             # Generated test cases by priority
+#   ├── scripts/
+#   │   ├── smoke/                      # P0 smoke test scripts
+#   │   └── sqa/                        # P1-P3 SQA test scripts
+#   ├── execution/
+#   │   ├── smoke-p0-report.json        # Test execution report
+#   │   ├── smoke-p0-output.log         # Full test output
+#   │   ├── critical-sqa-p1-report.json
+#   │   ├── critical-sqa-p1-output.log
+#   │   └── run-{timestamp}.json        # Each test run
+#   ├── bugs/
+#   │   ├── bug-001-description.md      # Bug report with details
+#   │   ├── bug-001-reproduction.md     # Steps to reproduce
+#   │   └── bug-002-description.md
+#   └── fixes/
+#       ├── fix-001-changes.md          # What was changed
+#       ├── fix-001-verification.md     # How it was verified
+#       └── fix-002-changes.md
+
+output:
+  # Root directory for all test artifacts
+  test_artifacts_root: "docs/test-artifacts"
+
+  # Legacy directories (for backward compatibility)
+  status_dir: "state/l2"
+  test_env_dir: "state/test-env"
+
+  # Subdirectories within {test_artifacts_root}/{story_id}/
+  design_dir: "design"          # TDM and test cases
+  scripts_dir: "scripts"        # Generated test scripts
+  execution_dir: "execution"    # Test run reports and logs
+  bugs_dir: "bugs"             # Bug reports
+  fixes_dir: "fixes"           # Fix documentation
+
+# ============================================
+# STAGES
+# ============================================
+
+stages:
+  # Stage 1: Check if tests are required for this story type
+  check-test-required:
+    order: 1
+    enabled: true
+    execution: direct
+    description: "Check if story type requires tests"
+
+  # Stage 2: Run parallel tracks (L1 dev + test design)
+  parallel-tracks:
+    order: 2
+    enabled: true
+    execution: parallel
+    timeout: 21600  # 6 hours (increased from 4h to allow more time for complex development)
+    tracks:
+      dev:
+        delegate_to: "/orchestrate-dev"
+        timeout: 21600  # 6 hours (increased from 3h to match parallel-tracks timeout)
+      test_design:
+        delegate_to: "/orchestrate-test-design"
+        timeout: 3600  # 1 hour (increased from 30min for larger stories)
+    description: "Run L1 dev and test design in parallel"
+
+  # Stage 3: Deploy to test environment
+  deploy:
+    order: 3
+    enabled: true
+    execution: spawn
+    timeout: 600
+    on_failure: abort
+    description: "Deploy application to test environment"
+    prompt: |
+      {autonomy}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+
+      You are a deployment agent. Deploy the application to a local test environment.
+
+      STEP 1: CHECK DEPLOYMENT METHOD
+      Look for deployment configuration in:
+      - docs/architecture.md
+      - package.json scripts
+      - docker-compose.yml
+      - Makefile
+
+      STEP 2: DETERMINE DEPLOYMENT COMMAND
+      Common deployment methods:
+      - docker-compose up -d (if docker-compose.yml exists)
+      - npm run dev (for Node.js apps)
+      - npm run start (for production builds)
+      - make run (if Makefile exists)
+
+      STEP 3: EXECUTE DEPLOYMENT
+      Run the appropriate deployment command.
+
+      STEP 4: HEALTH CHECK
+      Wait for application to be healthy:
+      - Check if main URL responds (e.g., http://localhost:3000)
+      - Check health endpoint if available (e.g., /health, /api/health)
+
+      STEP 5: RECORD DEPLOYMENT INFO
+      Output:
+      - Deployment method used
+      - Application URL
+      - Health check status
+
+  # Stage 4: Generate test scripts from TDM
+  generate-scripts:
+    order: 4
+    enabled: true
+    execution: spawn
+    timeout: 600
+    on_failure: abort
+    description: "Generate test scripts from TDM via TEA"
+    prompt: |
+      {autonomy}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+      TDM File: {tdm_file}
+
+      You are a test automation engineer. Generate test scripts from the TDM.
+
+      STEP 1: READ TDM
+      Read the Test Design Matrix at {tdm_file}.
+      Extract test cases for:
+      - smoke_p0 (P0 smoke tests)
+      - critical_sqa_p1 (P1 critical tests)
+
+      STEP 2: DETERMINE TEST FRAMEWORK
+      Check project for test framework:
+      - Look for jest.config.* (Jest)
+      - Look for playwright.config.* (Playwright)
+      - Look for cypress.config.* (Cypress)
+      - Check package.json dependencies
+
+      STEP 3: GENERATE SMOKE TESTS (P0)
+      For each test in smoke_p0:
+      - Create test file at docs/test-artifacts/{story_id}/scripts/smoke/*.spec.ts
+      - Follow project test conventions
+      - Include setup/teardown
+      - Use descriptive file names (e.g., test-login.spec.ts)
+
+      STEP 4: GENERATE CRITICAL SQA TESTS (P1)
+      For each test in critical_sqa_p1:
+      - Create test file at docs/test-artifacts/{story_id}/scripts/sqa/critical/*.spec.ts
+      - Include security tests
+      - Include boundary tests
+      - Use descriptive file names
+
+      STEP 5: VERIFY TEST FILES
+      Ensure all test files are syntactically valid.
+
+      Output: List of generated test files with full paths
+
+  # Stage 5: Run smoke tests (P0)
+  smoke-tests:
+    order: 5
+    enabled: true
+    execution: direct
+    command: "npm run test:smoke"
+    timeout: 600
+    on_failure: fix_and_retry
+    retry:
+      max: 3
+    description: "Run P0 smoke tests"
+    prompt: |
+      {autonomy}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+      Story File: {story_file}
+      Deploy URL: {deploy_url}
+      Bug Number: #{bug_number}
+      Fix Attempt: {attempt}
+
+      ## Resources Available
+
+      ### Bug Report (Full Details)
+      Location: {bug_file}
+      Read this file for complete failure output and context.
+
+      ### Test Scripts (Expected Behavior)
+      Location: {test_scripts_dir}/{test_type}/
+      Read these to understand what the tests expect.
+
+      ### Test Logs (Full Output)
+      Location: {test_logs}/
+      Files:
+      - {test_type}-p0-output.log (or -p1)
+      - {test_type}-p0-report.json
+
+      ### Story Requirements
+      Location: {story_file}
+      Review acceptance criteria to understand requirements.
+
+      ## Your Task
+
+      Fix the application code to make the tests pass.
+
+      ### STEP 1: READ BUG REPORT
+      Read {bug_file} to see:
+      - Full test failure output
+      - Which tests failed
+      - Error messages
+
+      ### STEP 2: UNDERSTAND EXPECTED BEHAVIOR
+      Read the failing test scripts at {test_scripts_dir}/{test_type}/ to understand:
+      - What the tests expect
+      - Input/output patterns
+      - Edge cases being tested
+
+      ### STEP 3: REVIEW REQUIREMENTS
+      Read {story_file} to confirm:
+      - Acceptance criteria
+      - Expected functionality
+
+      ### STEP 4: IDENTIFY ROOT CAUSE
+      Common issues:
+      - Missing functionality
+      - Incorrect implementation
+      - API response format mismatch
+      - Edge case not handled
+      - Validation errors
+
+      ### STEP 5: FIX THE APPLICATION CODE
+      - Find the relevant source files (check src/, lib/, api/, components/)
+      - Apply fixes using the Edit tool
+      - DO NOT modify the test scripts - tests are the source of truth
+
+      ### STEP 6: COMMIT YOUR CHANGES
+      After fixing:
+      ```bash
+      git add <changed files>
+      git commit -m "fix(test): resolve {test_type} failures for {story_id} (bug #{bug_number})"
+      ```
+
+      ### STEP 7: DOCUMENT THE FIX
+      In your response, explain:
+      - What was wrong (root cause)
+      - What you changed (files and specific changes)
+      - Why the fix resolves the issue
+
+      Output: Summary of root cause and fixes applied
+
+  # Stage 6: Run critical SQA tests (P1)
+  critical-sqa:
+    order: 6
+    enabled: true
+    execution: direct
+    command: "npm run test:sqa:critical"
+    timeout: 900
+    on_failure: fix_and_retry
+    retry:
+      max: 3
+    description: "Run P1 critical SQA tests"
+    prompt: |
+      {autonomy}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+      Story File: {story_file}
+      Deploy URL: {deploy_url}
+      Bug Number: #{bug_number}
+      Fix Attempt: {attempt}
+
+      ## Resources Available
+
+      ### Bug Report (Full Details)
+      Location: {bug_file}
+      Read this file for complete failure output and context.
+
+      ### Test Scripts (Expected Behavior)
+      Location: {test_scripts_dir}/{test_type}/
+      Read these to understand what the tests expect.
+
+      ### Test Logs (Full Output)
+      Location: {test_logs}/
+      Files:
+      - {test_type}-p1-output.log
+      - {test_type}-p1-report.json
+
+      ### Story Requirements
+      Location: {story_file}
+      Review acceptance criteria to understand requirements.
+
+      ## Your Task
+
+      You are a dev agent fixing critical SQA test failures.
+
+      IMPORTANT: Fix the APPLICATION CODE, not the tests.
+      These are security and boundary tests - they MUST pass.
+
+      ### STEP 1: READ BUG REPORT
+      Read {bug_file} to see:
+      - Full test failure output
+      - Which security/boundary tests failed
+      - Error messages and stack traces
+
+      ### STEP 2: UNDERSTAND EXPECTED BEHAVIOR
+      Read the failing test scripts at {test_scripts_dir}/{test_type}/ to understand:
+      - Security requirements (XSS, SQL injection, auth)
+      - Boundary conditions (min/max values, limits)
+      - Edge cases being tested
+
+      ### STEP 3: REVIEW REQUIREMENTS
+      Read {story_file} to confirm:
+      - Security acceptance criteria
+      - Boundary specifications
+      - Expected functionality
+
+      ### STEP 4: IDENTIFY ROOT CAUSE
+      Common SQA issues:
+      - Input sanitization missing (XSS, SQL injection)
+      - Output encoding missing
+      - Validation bypassed or insufficient
+      - Boundary checks missing (min/max values)
+      - Error handling inadequate
+      - Authentication/authorization gaps
+
+      ### STEP 5: FIX THE APPLICATION CODE
+      Apply appropriate fixes:
+      - Add/fix input validation
+      - Add/fix output encoding
+      - Add/fix boundary checks
+      - Improve error handling
+      - DO NOT modify the test scripts - tests are the source of truth
+
+      ### STEP 6: COMMIT YOUR CHANGES
+      After fixing:
+      ```bash
+      git add <changed files>
+      git commit -m "fix(security): resolve critical SQA failures for {story_id} (bug #{bug_number})"
+      ```
+
+      ### STEP 7: DOCUMENT THE FIX
+      In your response, explain:
+      - What security/boundary issue was found (root cause)
+      - What you changed (files and specific changes)
+      - Why the fix resolves the issue
+      - Any security implications
+
+      Output: Summary of root cause and fixes applied
+
+# Output variables captured from execution
+output:
+  - story_id
+  - story_file
+  - dev_status
+  - test_design_status
+  - tdm_file
+  - deploy_url
+  - smoke_status
+  - critical_sqa_status
+  - fix_attempts
+  - ready_for_l3
+  - status

@@ -3,7 +3,6 @@
 import os
 import signal
 import subprocess
-import tempfile
 import time
 import threading
 import atexit
@@ -13,7 +12,7 @@ from typing import Optional, Callable, Dict, List, Union
 from enum import Enum
 
 
-from .config import IntegrateConfig as DevConfig, StageConfig
+from .config import TestDesignConfig, StageConfig
 
 
 class TaskStatus(str, Enum):
@@ -59,16 +58,7 @@ class BackgroundTask:
         return self.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.TIMEOUT)
 
     def get_result(self, block: bool = True, poll_interval: float = 1.0) -> TaskResult:
-        """
-        Get the task result.
-
-        Args:
-            block: If True, wait for completion. If False, return current state.
-            poll_interval: How often to check status when blocking.
-
-        Returns:
-            TaskResult with current or final state.
-        """
+        """Get the task result."""
         if block:
             while not self.is_done():
                 time.sleep(poll_interval)
@@ -76,7 +66,6 @@ class BackgroundTask:
         if self._result:
             return self._result
 
-        # Return current state if not done
         return TaskResult(
             success=False,
             output="",
@@ -98,26 +87,25 @@ class ClaudeSpawner:
     Spawn Claude CLI processes for isolated task execution.
 
     Supports both blocking and background (non-blocking) execution modes.
-    Uses temp files for output capture to avoid pipe blocking issues.
     """
 
     def __init__(
         self,
         project_root: Path,
         timeout_seconds: int = 600,
-        config: Optional[DevConfig] = None,
+        config: Optional[TestDesignConfig] = None,
     ):
         self.project_root = Path(project_root)
         self.timeout_seconds = timeout_seconds
         self.config = config
         self._task_counter = 0
         self._active_tasks: Dict[str, BackgroundTask] = {}
-        self._all_spawned_processes: List[subprocess.Popen] = []  # Track all spawned Popen objects
+        self._all_spawned_processes: List[subprocess.Popen] = []
 
-        # Register cleanup handler to kill orphaned processes on exit
+        # Register cleanup handler
         atexit.register(self._cleanup_all_processes)
 
-    def set_config(self, config: DevConfig) -> None:
+    def set_config(self, config: TestDesignConfig) -> None:
         """Set the config after initialization."""
         self.config = config
 
@@ -140,17 +128,17 @@ class ClaudeSpawner:
         try:
             return stage.prompt.format(**kwargs).strip()
         except KeyError:
-            prompt = stage.prompt
+            # Provide defaults for missing keys
             kwargs_with_defaults = {
                 "autonomy": self.config.autonomy_instructions,
                 "project_root": str(self.project_root),
                 "story_id": kwargs.get("story_id", "{story_id}"),
                 "story_file": kwargs.get("story_file", "{story_file}"),
-                "errors": kwargs.get("errors", "{errors}"),
-                "files_changed": kwargs.get("files_changed", "{files_changed}"),
-                "known_issues": kwargs.get("known_issues", ""),  # Default to empty
+                "tdm_output": kwargs.get("tdm_output", "{tdm_output}"),
+                "tdm_file": kwargs.get("tdm_file", "{tdm_file}"),
+                "validation_errors": kwargs.get("validation_errors", "None"),
             }
-            return prompt.format(**kwargs_with_defaults).strip()
+            return stage.prompt.format(**kwargs_with_defaults).strip()
 
     def _build_command(self, prompt: str) -> List[str]:
         """Build the claude CLI command."""
@@ -160,7 +148,7 @@ class ClaudeSpawner:
             "--model", "sonnet",
             "--permission-mode", "bypassPermissions",
             "--no-session-persistence",
-            "--output-format", "text",  # Ensure plain text output
+            "--output-format", "text",
             "-p", prompt
         ]
 
@@ -171,11 +159,7 @@ class ClaudeSpawner:
         on_complete: Optional[Callable[[TaskResult], None]] = None,
         **kwargs
     ) -> BackgroundTask:
-        """
-        Spawn Claude CLI in the background (non-blocking).
-
-        Uses temp files for output to avoid pipe blocking issues.
-        """
+        """Spawn Claude CLI in the background (non-blocking)."""
         prompt = self.build_prompt_from_config(stage_name, **kwargs)
 
         if not prompt:
@@ -193,14 +177,12 @@ class ClaudeSpawner:
             )
             return task
 
-        # Get timeout from stage config if not overridden
         if timeout is None and self.config:
             stage = self.config.stages.get(stage_name)
             if stage:
                 timeout = stage.timeout
         timeout = timeout or self.timeout_seconds
 
-        # Create task
         self._task_counter += 1
         task_id = f"task_{self._task_counter}_{stage_name}"
         task = BackgroundTask(
@@ -209,7 +191,6 @@ class ClaudeSpawner:
             timeout=timeout,
         )
 
-        # Start background thread
         def run_task():
             self._execute_task(task, prompt, on_complete)
 
@@ -225,24 +206,16 @@ class ClaudeSpawner:
         prompt: str,
         on_complete: Optional[Callable[[TaskResult], None]] = None,
     ) -> None:
-        """
-        Execute task in background thread.
-
-        Uses temp files for stdout/stderr to avoid pipe blocking issues
-        when child processes inherit file descriptors.
-        """
+        """Execute task in background thread."""
         cmd = self._build_command(prompt)
         task.start_time = time.time()
         task.status = TaskStatus.RUNNING
 
         print(f"[spawner] Starting task {task.task_id}, timeout={task.timeout}s", flush=True)
-        print(f"[spawner] Command: {' '.join(cmd[:5])}... (prompt truncated)", flush=True)
 
-        # Create temp directory under project root to avoid OS cleanup
         temp_dir = self.project_root / ".orchestrate-temp"
         temp_dir.mkdir(exist_ok=True)
 
-        # Create temp files for output (avoids pipe blocking)
         stdout_path = temp_dir / f"{task.task_id}.stdout"
         stderr_path = temp_dir / f"{task.task_id}.stderr"
 
@@ -252,10 +225,7 @@ class ClaudeSpawner:
         task._stdout_file = str(stdout_path)
         task._stderr_file = str(stderr_path)
 
-        print(f"[spawner] Temp files: stdout={stdout_path}, stderr={stderr_path}", flush=True)
-
         try:
-            # Start process with output to temp files
             task.process = subprocess.Popen(
                 cmd,
                 cwd=str(self.project_root),
@@ -266,11 +236,8 @@ class ClaudeSpawner:
             )
 
             print(f"[spawner] Process started with PID {task.process.pid}", flush=True)
-
-            # Track process for cleanup on exit
             self._all_spawned_processes.append(task.process)
 
-            # Poll for completion (non-blocking)
             poll_interval = 0.5
             last_log = time.time()
 
@@ -278,7 +245,6 @@ class ClaudeSpawner:
                 time.sleep(poll_interval)
                 elapsed = time.time() - task.start_time
 
-                # Log progress every 30 seconds
                 if time.time() - last_log >= 30:
                     print(f"[spawner] Task {task.task_id} still running ({elapsed:.0f}s)", flush=True)
                     last_log = time.time()
@@ -289,15 +255,12 @@ class ClaudeSpawner:
                     task.status = TaskStatus.TIMEOUT
                     break
 
-            # Process finished or timed out
             exit_code = task.process.returncode if task.process.returncode is not None else -1
             print(f"[spawner] Task {task.task_id} process ended, exit_code={exit_code}", flush=True)
 
-            # Remove from tracking (process is done)
             if task.process in self._all_spawned_processes:
                 self._all_spawned_processes.remove(task.process)
 
-            # Flush and close file handles
             try:
                 stdout_file.flush()
                 os.fsync(stdout_file.fileno())
@@ -312,19 +275,10 @@ class ClaudeSpawner:
                 pass
             stderr_file.close()
 
-            # Small delay to ensure filesystem has synced
             time.sleep(0.1)
 
-            # Verify files exist before reading
-            print(f"[spawner] Checking temp files exist:", flush=True)
-            print(f"[spawner]   stdout: {task._stdout_file} exists={os.path.exists(task._stdout_file)}", flush=True)
-            print(f"[spawner]   stderr: {task._stderr_file} exists={os.path.exists(task._stderr_file)}", flush=True)
-
-            # Read output from temp files
             stdout_content = self._read_and_cleanup(task._stdout_file)
             stderr_content = self._read_and_cleanup(task._stderr_file)
-
-            print(f"[spawner] Task {task.task_id} output: stdout={len(stdout_content)} chars, stderr={len(stderr_content)} chars", flush=True)
 
             duration = time.time() - task.start_time
 
@@ -350,7 +304,7 @@ class ClaudeSpawner:
                     status=task.status,
                 )
 
-            print(f"[spawner] Task {task.task_id} completed: success={task._result.success}, status={task.status}", flush=True)
+            print(f"[spawner] Task {task.task_id} completed: success={task._result.success}", flush=True)
 
         except Exception as e:
             print(f"[spawner] Task {task.task_id} EXCEPTION: {e}", flush=True)
@@ -360,7 +314,6 @@ class ClaudeSpawner:
             duration = time.time() - task.start_time
             self._kill_process_tree(task.process)
 
-            # Cleanup temp files
             try:
                 stdout_file.close()
                 stderr_file.close()
@@ -379,7 +332,6 @@ class ClaudeSpawner:
                 status=TaskStatus.FAILED,
             )
 
-        # Call completion callback
         if on_complete and task._result:
             try:
                 on_complete(task._result)
@@ -389,196 +341,27 @@ class ClaudeSpawner:
     def _read_and_cleanup(self, filepath: Optional[str], keep_file: bool = False) -> str:
         """Read content from temp file and optionally delete it."""
         if not filepath:
-            print(f"[spawner] _read_and_cleanup: filepath is None", flush=True)
             return ""
 
-        # Check if file exists
         if not os.path.exists(filepath):
-            print(f"[spawner] _read_and_cleanup: file does not exist: {filepath}", flush=True)
             return ""
 
         try:
-            # Get file size first
-            file_size = os.path.getsize(filepath)
-            print(f"[spawner] _read_and_cleanup: reading {filepath} (size={file_size} bytes)", flush=True)
-
             with open(filepath, 'r') as f:
                 content = f.read()
 
-            print(f"[spawner] _read_and_cleanup: read {len(content)} chars from {filepath}", flush=True)
-
             if not keep_file:
                 os.unlink(filepath)
-                print(f"[spawner] _read_and_cleanup: deleted {filepath}", flush=True)
 
             return content
         except Exception as e:
-            print(f"[spawner] _read_and_cleanup: ERROR reading {filepath}: {e}", flush=True)
+            print(f"[spawner] Error reading {filepath}: {e}", flush=True)
             if not keep_file:
                 try:
                     os.unlink(filepath)
                 except:
                     pass
             return ""
-
-    def spawn_layer(
-        self,
-        layer_skill: str,
-        story_input: Optional[str] = None,
-        timeout: int = 3600
-    ) -> TaskResult:
-        """
-        Spawn another orchestrate layer skill.
-
-        Args:
-            layer_skill: Skill to call (e.g., "/orchestrate-dev" or "/orchestrate-prepare")
-            story_input: Optional story ID or file path to pass to the layer
-            timeout: Max execution time in seconds
-
-        Returns:
-            TaskResult with success/failure
-        """
-        # Build command
-        if story_input:
-            prompt = f"{layer_skill} {story_input}"
-        else:
-            prompt = layer_skill
-
-        print(f"[spawner] Delegating to layer: {layer_skill}", flush=True)
-        if story_input:
-            print(f"[spawner]   Story input: {story_input}", flush=True)
-
-        # Use claude CLI to call the skill
-        cmd = [
-            "claude",
-            "--print",
-            "--model", "sonnet",
-            "--permission-mode", "bypassPermissions",
-            "--no-session-persistence",
-            "--output-format", "text",
-            "-p", prompt
-        ]
-
-        # Create temp directory under project root
-        temp_dir = self.project_root / ".orchestrate-temp"
-        temp_dir.mkdir(exist_ok=True)
-
-        # Create temp files for output
-        task_id = f"layer_{layer_skill.replace('/', '_')}_{int(time.time())}"
-        stdout_path = temp_dir / f"{task_id}.stdout"
-        stderr_path = temp_dir / f"{task_id}.stderr"
-
-        stdout_file = open(stdout_path, 'w+')
-        stderr_file = open(stderr_path, 'w+')
-
-        print(f"[spawner] Layer delegation command: {' '.join(cmd[:6])}...", flush=True)
-
-        start_time = time.time()
-        process = None
-
-        try:
-            process = subprocess.Popen(
-                cmd,
-                cwd=str(self.project_root),
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                start_new_session=True,
-            )
-
-            print(f"[spawner] Layer process started with PID {process.pid}", flush=True)
-
-            # Track process for cleanup on exit
-            self._all_spawned_processes.append(process)
-
-            # Poll for completion
-            poll_interval = 1.0
-            last_log = time.time()
-
-            while process.poll() is None:
-                time.sleep(poll_interval)
-                elapsed = time.time() - start_time
-
-                # Periodic logging
-                if time.time() - last_log >= 60:  # Log every minute for layers
-                    print(f"[spawner] Layer {layer_skill} still running ({elapsed:.0f}s)", flush=True)
-                    last_log = time.time()
-
-                # Check for timeout (uses config timeout)
-                if elapsed > timeout:
-                    print(f"[spawner] Layer {layer_skill} TIMEOUT after {elapsed:.0f}s", flush=True)
-                    self._kill_process_tree(process)
-
-                    stdout_file.flush()
-                    stdout_file.close()
-                    stderr_file.flush()
-                    stderr_file.close()
-                    time.sleep(0.1)
-
-                    stdout_content = self._read_and_cleanup(str(stdout_path))
-                    stderr_content = self._read_and_cleanup(str(stderr_path))
-
-                    return TaskResult(
-                        success=False,
-                        output=stdout_content,
-                        error=f"Layer {layer_skill} timed out after {timeout}s. stderr: {stderr_content}",
-                        exit_code=-1,
-                        duration_seconds=time.time() - start_time,
-                        status=TaskStatus.TIMEOUT,
-                    )
-
-            # Process completed
-            print(f"[spawner] Layer completed, exit_code={process.returncode}", flush=True)
-
-            # Remove from tracking (process is done)
-            if process in self._all_spawned_processes:
-                self._all_spawned_processes.remove(process)
-
-            stdout_file.flush()
-            stdout_file.close()
-            stderr_file.flush()
-            stderr_file.close()
-            time.sleep(0.1)
-
-            stdout_content = self._read_and_cleanup(str(stdout_path))
-            stderr_content = self._read_and_cleanup(str(stderr_path))
-            duration = time.time() - start_time
-
-            print(f"[spawner] Layer output: stdout={len(stdout_content)} chars, stderr={len(stderr_content)} chars", flush=True)
-
-            # Success based on exit code only - delegate layers handle their own validation
-            success = process.returncode == 0
-
-            return TaskResult(
-                success=success,
-                output=stdout_content,
-                error=stderr_content if stderr_content else None,
-                exit_code=process.returncode,
-                duration_seconds=duration,
-            )
-
-        except Exception as e:
-            print(f"[spawner] Layer delegation EXCEPTION: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
-
-            duration = time.time() - start_time
-            self._kill_process_tree(process)
-            try:
-                stdout_file.close()
-                stderr_file.close()
-            except:
-                pass
-            self._read_and_cleanup(str(stdout_path))
-            self._read_and_cleanup(str(stderr_path))
-
-            return TaskResult(
-                success=False,
-                output="",
-                error=str(e),
-                exit_code=-1,
-                duration_seconds=duration,
-            )
 
     def spawn_stage(
         self,
@@ -588,23 +371,10 @@ class ClaudeSpawner:
         on_complete: Optional[Callable[[TaskResult], None]] = None,
         **kwargs
     ) -> Union[TaskResult, BackgroundTask]:
-        """
-        Spawn Claude CLI for a specific stage.
-
-        Args:
-            stage_name: Name of the stage (e.g., 'create-story', 'develop')
-            timeout: Override timeout in seconds
-            background: If True, run in background and return immediately
-            on_complete: Callback for when background task completes
-            **kwargs: Variables for prompt template
-
-        Returns:
-            TaskResult (blocking) or BackgroundTask (background)
-        """
+        """Spawn Claude CLI for a specific stage."""
         if background:
             return self.spawn_background(stage_name, timeout, on_complete, **kwargs)
 
-        # Blocking mode - spawn and wait
         prompt = self.build_prompt_from_config(stage_name, **kwargs)
 
         if not prompt:
@@ -623,82 +393,20 @@ class ClaudeSpawner:
 
         return self.spawn_with_prompt(prompt, timeout, stage_name=stage_name)
 
-    def spawn_agent(
-        self,
-        prompt: str,
-        timeout: Optional[int] = None,
-        background: bool = False,
-        task_id_prefix: Optional[str] = None,
-        on_complete: Optional[Callable[[TaskResult], None]] = None,
-    ) -> Union[TaskResult, BackgroundTask]:
-        """
-        Spawn a Claude agent with a custom prompt.
-
-        This is used for task-by-task execution where prompts are built
-        dynamically rather than from config.
-
-        Args:
-            prompt: The complete prompt to send to Claude
-            timeout: Override timeout in seconds
-            background: If True, run in background and return immediately
-            task_id_prefix: Prefix for task ID (helps with debugging)
-            on_complete: Callback for when background task completes
-
-        Returns:
-            TaskResult (blocking) or BackgroundTask (background)
-        """
-        if not background:
-            # Blocking execution
-            return self.spawn_with_prompt(
-                prompt=prompt,
-                timeout=timeout,
-                stage_name=task_id_prefix or "custom-agent"
-            )
-
-        # Background execution
-        actual_timeout = timeout or self.timeout_seconds
-
-        # Create task
-        self._task_counter += 1
-        task_id = f"{task_id_prefix or 'agent'}_{self._task_counter}"
-        task = BackgroundTask(
-            task_id=task_id,
-            stage_name=task_id_prefix or "custom-agent",
-            timeout=actual_timeout,
-        )
-
-        # Start background thread
-        def run_task():
-            self._execute_task(task, prompt, on_complete)
-
-        task._thread = threading.Thread(target=run_task, daemon=True)
-        task._thread.start()
-
-        self._active_tasks[task_id] = task
-        return task
-
     def spawn_with_prompt(
         self,
         prompt: str,
         timeout: Optional[int] = None,
         stage_name: Optional[str] = None,
     ) -> TaskResult:
-        """
-        Spawn Claude CLI with a pre-built prompt (blocking).
-
-        Uses temp files for output to avoid pipe blocking.
-        """
+        """Spawn Claude CLI with a pre-built prompt (blocking)."""
         actual_timeout = timeout or self.timeout_seconds
         cmd = self._build_command(prompt)
 
-        # Create temp directory under project root
         temp_dir = self.project_root / ".orchestrate-temp"
         temp_dir.mkdir(exist_ok=True)
 
-        # Determine task label for file names and logging
         task_label = stage_name if stage_name else "task"
-
-        # Create temp files for output
         task_id = f"{task_label}_{int(time.time())}"
         stdout_path = temp_dir / f"{task_id}.stdout"
         stderr_path = temp_dir / f"{task_id}.stderr"
@@ -706,8 +414,7 @@ class ClaudeSpawner:
         stdout_file = open(stdout_path, 'w+')
         stderr_file = open(stderr_path, 'w+')
 
-        print(f"[spawner] Blocking spawn: {' '.join(cmd[:5])}...", flush=True)
-        print(f"[spawner] Temp files: {stdout_path}, {stderr_path}", flush=True)
+        print(f"[spawner] Blocking spawn: {task_label}", flush=True)
 
         start_time = time.time()
         process = None
@@ -723,11 +430,8 @@ class ClaudeSpawner:
             )
 
             print(f"[spawner] Process started with PID {process.pid}", flush=True)
-
-            # Track process for cleanup on exit
             self._all_spawned_processes.append(process)
 
-            # Poll for completion
             poll_interval = 0.5
             last_log = time.time()
             while process.poll() is None:
@@ -760,10 +464,8 @@ class ClaudeSpawner:
                         status=TaskStatus.TIMEOUT,
                     )
 
-            # Process completed
-            print(f"[spawner] Blocking task completed, exit_code={process.returncode}", flush=True)
+            print(f"[spawner] Task completed, exit_code={process.returncode}", flush=True)
 
-            # Remove from tracking (process is done)
             if process in self._all_spawned_processes:
                 self._all_spawned_processes.remove(process)
 
@@ -773,13 +475,9 @@ class ClaudeSpawner:
             stderr_file.close()
             time.sleep(0.1)
 
-            print(f"[spawner] Checking files: stdout={stdout_path.exists()}, stderr={stderr_path.exists()}", flush=True)
-
             stdout_content = self._read_and_cleanup(str(stdout_path))
             stderr_content = self._read_and_cleanup(str(stderr_path))
             duration = time.time() - start_time
-
-            print(f"[spawner] Output: stdout={len(stdout_content)} chars, stderr={len(stderr_content)} chars", flush=True)
 
             return TaskResult(
                 success=process.returncode == 0,
@@ -790,7 +488,7 @@ class ClaudeSpawner:
             )
 
         except Exception as e:
-            print(f"[spawner] Blocking task EXCEPTION: {e}", flush=True)
+            print(f"[spawner] Task EXCEPTION: {e}", flush=True)
             duration = time.time() - start_time
             self._kill_process_tree(process)
             try:
@@ -810,55 +508,40 @@ class ClaudeSpawner:
             )
 
     def _kill_process_tree(self, process: Optional[subprocess.Popen]) -> None:
-        """
-        Kill a process and all its children.
-
-        Tries multiple strategies to ensure process is terminated.
-        """
+        """Kill a process and all its children."""
         if not process:
             return
 
         pid = process.pid
 
         if os.name != 'nt':
-            # Unix/Mac: Kill process group to get children too
             try:
                 pgid = os.getpgid(pid)
-                # Send SIGTERM first (graceful)
                 os.killpg(pgid, signal.SIGTERM)
                 time.sleep(0.3)
 
-                # Check if still alive
                 if process.poll() is None:
-                    # Still alive, force kill
                     try:
                         os.killpg(pgid, signal.SIGKILL)
                     except ProcessLookupError:
-                        pass  # Already dead
+                        pass
 
             except (ProcessLookupError, PermissionError, OSError):
-                # Fallback: Kill process directly (not process group)
                 try:
                     os.kill(pid, signal.SIGTERM)
                     time.sleep(0.3)
                     if process.poll() is None:
                         os.kill(pid, signal.SIGKILL)
                 except (ProcessLookupError, OSError):
-                    pass  # Already dead
+                    pass
         else:
-            # Windows: Use process.kill()
             try:
                 process.kill()
             except (ProcessLookupError, OSError):
-                pass  # Already dead
+                pass
 
     def _cleanup_all_processes(self) -> None:
-        """
-        Cleanup handler called on exit to kill all orphaned processes.
-
-        This prevents spawned Claude processes from running forever
-        if the orchestrator exits unexpectedly.
-        """
+        """Cleanup handler called on exit to kill all orphaned processes."""
         if not self._all_spawned_processes:
             return
 
@@ -866,22 +549,15 @@ class ClaudeSpawner:
 
         for process in self._all_spawned_processes:
             try:
-                # Check if process still running
                 if process.poll() is not None:
-                    # Already dead
                     continue
 
                 pid = process.pid
                 print(f"[spawner] CLEANUP: Killing process {pid}...", flush=True)
-
-                # Use process tree kill method
                 self._kill_process_tree(process)
-
-                # Wait a bit for kill to take effect
                 time.sleep(0.1)
 
             except (ProcessLookupError, OSError) as e:
-                # Process doesn't exist or permission error
                 print(f"[spawner] CLEANUP: Error killing process: {e}", flush=True)
 
         print(f"[spawner] CLEANUP: Complete", flush=True)

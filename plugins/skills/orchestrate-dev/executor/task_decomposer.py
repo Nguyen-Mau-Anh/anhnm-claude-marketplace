@@ -23,6 +23,21 @@ def parse_story_tasks(story_file: Path) -> List[Task]:
     """
     Parse story file and extract all tasks.
 
+    Supports two formats:
+    1. Flat format (original):
+       ## Tasks
+       - [ ] Main task 1
+         - [ ] Subtask 1.1
+       - [ ] Main task 2
+
+    2. BMAD format (nested):
+       ## Implementation Tasks
+       ### Task 1: Title
+       - [ ] Subtask 1.1
+       - [ ] Subtask 1.2
+       ### Task 2: Title
+       - [ ] Subtask 2.1
+
     Returns:
         List of Task objects, preserving order from story file.
     """
@@ -32,16 +47,79 @@ def parse_story_tasks(story_file: Path) -> List[Task]:
     content = story_file.read_text()
     tasks = []
 
-    # Find Tasks section (supports both "## Tasks" and "## Tasks / Subtasks")
+    # Try BMAD format first: "## Implementation Tasks" with "### Task N:" sections
+    bmad_match = re.search(r'^##\s*Implementation\s+Tasks', content, re.MULTILINE)
+    if bmad_match:
+        return _parse_bmad_format(content, bmad_match.end())
+
+    # Fall back to flat format: "## Tasks" with direct "- [ ]" items
     tasks_match = re.search(r'^##\s*Tasks\s*(/\s*Subtasks)?', content, re.MULTILINE)
     if not tasks_match:
         return []
 
+    return _parse_flat_format(content, tasks_match.end())
+
+
+def _parse_bmad_format(content: str, start_pos: int) -> List[Task]:
+    """Parse BMAD-style tasks with ### Task N: headers."""
+    tasks = []
+
+    # Find next ## section or end
+    next_section = re.search(r'^##\s+', content[start_pos:], re.MULTILINE)
+    tasks_end = next_section.start() + start_pos if next_section else len(content)
+    tasks_content = content[start_pos:tasks_end]
+
+    # Find all ### Task N: sections
+    task_pattern = r'^###\s*Task\s+(\d+):\s*(.+?)$'
+    task_matches = list(re.finditer(task_pattern, tasks_content, re.MULTILINE))
+
+    for i, match in enumerate(task_matches):
+        task_num = int(match.group(1))
+        task_title = match.group(2).strip()
+
+        # Extract content between this task and next task (or end)
+        task_start = match.end()
+        if i + 1 < len(task_matches):
+            task_end = task_matches[i + 1].start()
+        else:
+            task_end = len(tasks_content)
+
+        task_section = tasks_content[task_start:task_end]
+
+        # Extract all checkboxes in this section as subtasks
+        subtasks = []
+        all_checked = []  # Track checkbox states
+        checkbox_pattern = r'^- \[([ x])\] (.+?)$'
+        for checkbox_match in re.finditer(checkbox_pattern, task_section, re.MULTILINE):
+            checkbox_state = checkbox_match.group(1)
+            checkbox_text = checkbox_match.group(2).strip()
+            subtasks.append(checkbox_text)
+            all_checked.append(checkbox_state == 'x')
+
+        # Task is complete only if ALL subtasks are checked
+        is_complete = len(subtasks) > 0 and all(all_checked)
+
+        # Build task content (title + all subtasks as formatted list)
+        task_content = f"{task_title}\n" + "\n".join([f"- [ ] {st}" for st in subtasks])
+
+        tasks.append(Task(
+            index=task_num,
+            content=task_content,
+            is_complete=is_complete,
+            subtasks=subtasks
+        ))
+
+    return tasks
+
+
+def _parse_flat_format(content: str, start_pos: int) -> List[Task]:
+    """Parse flat-style tasks with direct - [ ] items."""
+    tasks = []
+
     # Extract content after Tasks header until next ## section or end
-    tasks_start = tasks_match.end()
-    next_section = re.search(r'^##\s+', content[tasks_start:], re.MULTILINE)
-    tasks_end = next_section.start() + tasks_start if next_section else len(content)
-    tasks_content = content[tasks_start:tasks_end]
+    next_section = re.search(r'^##\s+', content[start_pos:], re.MULTILINE)
+    tasks_end = next_section.start() + start_pos if next_section else len(content)
+    tasks_content = content[start_pos:tasks_end]
 
     # Parse tasks: - [ ] or - [x] at start of line
     task_pattern = r'^- \[([ x])\] (.+?)(?=^- \[|^##|\Z)'

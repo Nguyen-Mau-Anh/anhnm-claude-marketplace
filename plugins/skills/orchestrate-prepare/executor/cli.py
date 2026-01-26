@@ -17,25 +17,46 @@ console = Console()
 
 def get_project_root() -> Path:
     """
-    Get the project root directory.
+    Get the project root directory by walking up the tree.
 
-    Handles the case where we're running from inside .claude/skills/orchestrate-prepare
-    when called via subprocess delegation from Layer 1.
+    Looks for indicators of project root:
+    - .git directory
+    - .claude directory
+    - package.json (Node projects)
+    - pyproject.toml (Python projects)
+
+    This ensures we always find the true project root, regardless of
+    where the command is run from (e.g., packages/backend/).
     """
-    cwd = Path.cwd()
+    current = Path.cwd().resolve()
 
-    # Check if we're inside .claude/skills/ directory
-    # If so, go up to find the actual project root
-    parts = cwd.parts
-    if '.claude' in parts and 'skills' in parts:
-        # Find the index of .claude
-        claude_idx = parts.index('.claude')
-        # Project root is the parent of .claude
-        project_root = Path(*parts[:claude_idx])
-        return project_root
+    # Walk up the directory tree
+    while True:
+        # Check for project root indicators
+        if (current / '.git').exists():
+            return current
+        if (current / '.claude').exists():
+            return current
+        if (current / 'package.json').exists():
+            # Check if there's a parent with .git (in case of monorepo)
+            parent = current.parent
+            if parent != current and (parent / '.git').exists():
+                return parent
+            return current
+        if (current / 'pyproject.toml').exists():
+            # Check if there's a parent with .git (in case of monorepo)
+            parent = current.parent
+            if parent != current and (parent / '.git').exists():
+                return parent
+            return current
 
-    # Otherwise, cwd is the project root
-    return cwd
+        # Move up one level
+        parent = current.parent
+        if parent == current:
+            # Reached filesystem root, use cwd as fallback
+            return Path.cwd().resolve()
+
+        current = parent
 
 
 @app.callback(invoke_without_command=True)
