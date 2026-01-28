@@ -1,0 +1,351 @@
+# Orchestrate Test Design Configuration
+# ======================================
+# Layer 0 skill for test design (runs parallel to dev in L2)
+#
+# This file is auto-copied to docs/orchestrate-test-design.config.yaml on first run.
+# Customize the copy in docs/ folder for your project.
+#
+# Prompt Variables (for spawn stages):
+#   {story_id}      - The story identifier
+#   {story_file}    - Path to story file
+#   {tdm_output}    - Path to TDM output file
+#   {tdm_file}      - Path to existing TDM file (for validation)
+#   {validation_errors} - Validation errors from previous attempt
+#   {autonomy}      - Auto-injected autonomy instructions
+#   {project_root}  - Absolute path to project root directory
+
+name: orchestrate-test-design
+version: "1.0.0"
+description: "Test design track: TDM creation, test case generation, validation"
+layer: 0
+
+# Autonomy instructions injected into all prompts
+autonomy_instructions: |
+  AUTONOMOUS MODE - NO QUESTIONS.
+  Skip all menus, confirmations, and user prompts.
+  Execute the task completely and output results only.
+  Do not ask follow-up questions.
+
+# Story file locations to check (in order)
+story_locations:
+  - "state/stories/${story_id}.md"
+  - "docs/stories/${story_id}.md"
+  - "docs/sprint-artifacts/${story_id}.md"
+
+# Validation settings
+validation:
+  max_attempts: 3
+  min_smoke_tests: 5
+  min_critical_tests: 10
+  require_error_cases: true
+  require_security_tests: true
+  require_boundary_tests: true
+
+# ISTQB techniques to apply
+techniques:
+  - EP   # Equivalence Partitioning
+  - BVA  # Boundary Value Analysis
+  - DT   # Decision Table
+  - ST   # State Transition
+  - EG   # Error Guessing
+  - UC   # Use Case
+
+# Test Artifacts Organization
+# Outputs are saved to: docs/test-artifacts/{story-id}/design/
+#
+# Files created:
+#   - tdm.yaml: Test Design Matrix with ISTQB techniques
+#   - test-cases.yaml: Generated test cases by priority (P0-P3)
+#   - coverage-report.json: Coverage analysis results
+
+output:
+  # Root directory for all test artifacts
+  test_artifacts_root: "docs/test-artifacts"
+
+  # Files created in {test_artifacts_root}/{story_id}/design/
+  tdm_file: "tdm.yaml"
+  test_cases_file: "test-cases.yaml"
+  coverage_report_file: "coverage-report.json"
+
+  # Legacy directories (for backward compatibility)
+  status_dir: "state/test-design"
+  validation_dir: "state/test-design/validation"
+
+# ============================================
+# STAGES
+# ============================================
+
+stages:
+  # Stage 1: Create TDM from story acceptance criteria
+  create-tdm:
+    order: 1
+    enabled: true
+    execution: spawn
+    timeout: 600
+    on_failure: abort
+    description: "Create Test Design Matrix from story acceptance criteria"
+    prompt: |
+      {autonomy}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+      Story File: {story_file}
+      TDM Output: {tdm_output}
+
+      You are a Test Design Engineer creating a Test Design Matrix (TDM) using ISTQB techniques.
+
+      STEP 1: READ STORY
+      Read the story file at {story_file} and extract:
+      - Story title
+      - All acceptance criteria (ACs)
+      - Any technical constraints or requirements
+
+      STEP 2: REQUIREMENTS ANALYSIS
+      For each acceptance criterion:
+      - Determine if it's testable
+      - Identify input types and validation patterns
+      - Note boundary conditions
+      - Identify state changes or workflows
+      - Flag security considerations
+
+      STEP 3: SELECT ISTQB TECHNIQUES
+      For each AC, select applicable techniques:
+      - EP (Equivalence Partitioning): For input validation, data types
+      - BVA (Boundary Value Analysis): For numeric limits, lengths
+      - DT (Decision Table): For complex business rules
+      - ST (State Transition): For workflows, status changes
+      - EG (Error Guessing): For security, edge cases
+      - UC (Use Case): For user journeys
+
+      STEP 4: GENERATE TEST DESIGN
+      For each technique, create entries in the TDM:
+
+      Equivalence Partitioning:
+      ```yaml
+      equivalence_partitioning:
+        - id: EP-001
+          description: "What is being partitioned"
+          partitions:
+            valid: ["valid value 1", "valid value 2"]
+            invalid: ["", null, "malformed"]
+          maps_to: [AC1, AC2]
+      ```
+
+      Boundary Value Analysis:
+      ```yaml
+      boundary_value_analysis:
+        - id: BVA-001
+          description: "What boundary"
+          boundaries:
+            min: 8
+            max: 128
+          test_values:
+            below_min: [0, 7]
+            at_min: [8]
+            above_min: [9]
+            below_max: [127]
+            at_max: [128]
+            above_max: [129, 256]
+          maps_to: [AC1]
+      ```
+
+      Error Guessing:
+      ```yaml
+      error_guessing:
+        - id: EG-001
+          description: "Security attack vectors"
+          scenarios:
+            - sql_injection: "'; DROP TABLE users; --"
+            - xss_basic: "<script>alert('xss')</script>"
+          maps_to: [AC2]
+      ```
+
+      STEP 5: WRITE TDM FILE
+      Write the complete TDM YAML to {tdm_output} following the template structure:
+      - metadata section with story info
+      - requirements_analysis section
+      - test_design section with all techniques
+      - test_cases section (empty, will be filled in next stage)
+      - coverage section (empty, will be filled after validation)
+
+      Output: Path to created TDM file
+
+  # Stage 2: Generate test cases from TDM
+  generate-test-cases:
+    order: 2
+    enabled: true
+    execution: spawn
+    timeout: 600
+    on_failure: abort
+    description: "Generate concrete test cases from TDM design"
+    prompt: |
+      {autonomy}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+      TDM File: {tdm_file}
+
+      You are a Test Design Engineer generating concrete test cases from the TDM.
+
+      STEP 1: READ TDM
+      Read the TDM file at {tdm_file} and extract:
+      - All test design entries (EP, BVA, DT, ST, EG, UC)
+      - Acceptance criteria mappings
+
+      STEP 2: GENERATE P0 SMOKE TESTS
+      Create smoke tests that cover:
+      - Happy path for EACH main feature (at least 1 per AC)
+      - Basic error case for EACH main feature (at least 1 per AC)
+
+      IMPORTANT: Smoke tests MUST include error cases, not just happy paths!
+
+      Format:
+      ```yaml
+      smoke_p0:
+        - id: SMOKE-001
+          name: "Descriptive test name"
+          category: happy_path  # or basic_error
+          technique: EP
+          preconditions:
+            - "User is logged in"
+          steps:
+            - action: "Enter valid email"
+              input: "user@example.com"
+            - action: "Click submit"
+          expected_result: "Form submitted successfully"
+          maps_to: [AC1]
+      ```
+
+      STEP 3: GENERATE P1 CRITICAL SQA TESTS
+      Create critical tests that cover:
+      - Security tests (SQL injection, XSS prevention)
+      - Boundary tests (min, max, edge values)
+      - Null/empty input handling
+      - Edge cases that could cause failures
+
+      MUST INCLUDE:
+      - At least 2 security tests (SQL injection, XSS)
+      - At least 2 boundary tests per BVA entry
+      - At least 1 null/empty test per input field
+
+      STEP 4: GENERATE P2 FULL SQA TESTS
+      Create additional tests for:
+      - All remaining equivalence partitions
+      - Invalid state transitions
+      - Complex business rule combinations
+
+      STEP 5: GENERATE P3 EXTENDED SQA TESTS
+      Create tests for:
+      - Performance scenarios (large data sets)
+      - Accessibility checks
+      - Stress/load scenarios
+
+      STEP 6: UPDATE TDM FILE
+      Update the TDM file at {tdm_file} with all generated test cases.
+
+      STEP 7: UPDATE COVERAGE SUMMARY
+      Calculate and update the coverage section:
+      - acceptance_criteria: Map each AC to its test cases
+      - by_priority: Count tests per priority
+      - by_category: Count tests per category
+      - techniques_applied: Count tests per technique
+
+      Output: Summary of generated test cases by priority
+
+  # Stage 3: Validate test cases meet requirements
+  validate:
+    order: 3
+    enabled: true
+    execution: spawn
+    timeout: 300
+    on_failure: fix_and_retry
+    retry:
+      max: 3
+    description: "Validate test cases for coverage and quality"
+    prompt: |
+      {autonomy}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+      TDM File: {tdm_file}
+      Previous Validation Errors: {validation_errors}
+
+      You are a Test Design Engineer validating the test cases in the TDM.
+
+      STEP 1: READ TDM
+      Read the TDM file at {tdm_file}.
+
+      STEP 2: COVERAGE VALIDATION
+      Check all acceptance criteria have test coverage:
+      - For each AC in requirements_analysis, verify at least one test maps_to it
+      - List any ACs without test coverage
+
+      Check smoke suite includes error cases:
+      - Count tests with category: basic_error
+      - FAIL if smoke_p0 has no error cases
+
+      Check critical SQA includes security tests:
+      - Look for tests with category: security
+      - FAIL if no SQL injection test exists
+      - FAIL if no XSS test exists
+
+      Check critical SQA includes boundary tests:
+      - Look for tests with category: boundary
+      - FAIL if no boundary tests exist
+
+      STEP 3: QUALITY VALIDATION
+      For each test case, verify:
+      - Has clear expected_result (not empty)
+      - maps_to contains at least one AC
+      - steps are actionable (not vague)
+      - No duplicate test cases (same name or same steps)
+
+      STEP 4: GENERATE VALIDATION RESULT
+      Create validation result:
+      ```yaml
+      validation_result:
+        passed: true/false
+        issues:
+          - "AC2 has no test coverage"
+          - "Smoke suite missing error cases"
+        coverage:
+          acceptance_criteria: "100%"  # or percentage
+          techniques_used: [EP, BVA, EG]
+          smoke_tests: 5
+          critical_tests: 10
+          smoke_has_error_cases: true/false
+          critical_has_security: true/false
+          critical_has_boundaries: true/false
+      ```
+
+      STEP 5: IF VALIDATION FAILS
+      If validation fails:
+      1. Identify EXACTLY what is missing
+      2. Generate the missing test cases
+      3. Add them to the appropriate priority section
+      4. Update the TDM file
+      5. Recalculate coverage summary
+      6. Re-run validation
+
+      STEP 6: UPDATE TDM VALIDATION FLAGS
+      Update the coverage.validation section in TDM:
+      ```yaml
+      validation:
+        smoke_has_error_cases: true
+        critical_sqa_has_security: true
+        critical_sqa_has_boundaries: true
+        all_ac_covered: true
+      ```
+
+      Output: Validation result (PASSED or FAILED with specific issues)
+
+# Output variables captured from execution
+output:
+  - story_id
+  - story_file
+  - tdm_file
+  - test_cases_count
+  - validation_passed
+  - validation_attempts
+  - coverage
+  - status
