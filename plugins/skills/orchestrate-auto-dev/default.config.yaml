@@ -1,0 +1,1392 @@
+# Orchestrate Auto Dev - Unified Configuration
+# =============================================
+# This file is auto-copied to docs/orchestrate-auto-dev.config.yaml on first run.
+# Customize the copy in docs/ folder for your project.
+#
+# This is a FLATTENED configuration that combines all stages from:
+# - Story Preparation (create-story, validate)
+# - Development & Quality (develop, lint, typecheck, unit-test, code-review)
+# - Integration (git-commit, git-push, pr-create, pr-checks, pr-merge)
+#
+# Execution Model: HYBRID
+# - BMAD workflows: Spawned as separate agents (isolated context)
+# - Bash commands: Direct execution (shared context)
+# - Orchestration: Parent context (coordination)
+#
+# Prompt Variables (for spawn stages):
+#   {story_id}      - The story identifier
+#   {story_file}    - Path to story file
+#   {errors}        - Error output from failed command (for fix stages)
+#   {files_changed} - List of changed files (for code review)
+#   {pr_number}     - PR number (for pr stages)
+#   {pr_url}        - PR URL
+#   {commit_hash}   - Commit hash
+#   {branch_name}   - Git branch name
+#   {autonomy}      - Auto-injected autonomy instructions
+#   {project_root}  - Absolute path to project root directory
+#   {known_issues}  - Knowledge base lessons (auto-injected)
+
+name: orchestrate-auto-dev
+version: "1.0.0"
+description: "Automated development orchestrator - Complete story-to-PR pipeline"
+layer: 1
+
+# Autonomy instructions injected into all prompts
+autonomy_instructions: |
+  AUTONOMOUS MODE - NO QUESTIONS.
+  Skip all menus, confirmations, and user prompts.
+  Execute the task completely and output results only.
+  Do not ask follow-up questions.
+
+# Story Status Tracking (sprint-status.yaml)
+# The orchestrator MUST update story status after each stage completes.
+# Status transitions follow BMAD methodology:
+#   backlog → drafted → ready-for-dev → in-progress → review → done
+#
+# Status update mapping (orchestrator responsibility):
+#   After create-story completes    → Update to "drafted"
+#   After validate completes         → Update to "ready-for-dev"
+#   When develop starts              → Update to "in-progress"
+#   After code-review completes      → Update to "review"
+#   After pr-merge completes         → Update to "done"
+#
+# Location: docs/sprint-artifacts/sprint-status.yaml
+status_tracking:
+  enabled: true
+  file: "docs/sprint-artifacts/sprint-status.yaml"
+  transitions:
+    create-story: "drafted"
+    validate: "ready-for-dev"
+    develop_start: "in-progress"
+    code-review: "review"
+    pr-merge: "done"
+
+# Story file locations to check (in order)
+story_locations:
+  - "docs/sprint-artifacts/${story_id}.md"
+  - "docs/stories/${story_id}.md"
+  - "state/stories/${story_id}.md"
+
+# Task Decomposition Configuration
+# Controls whether development happens task-by-task or all-at-once
+task_decomposition:
+  enabled: true                    # Enable task-by-task execution
+  mode: "per_task"                # "per_task" = 1 agent per task, "single" = 1 agent for all tasks
+  # Task decomposition will:
+  # 1. Parse story file to extract tasks (supports BMAD and flat formats)
+  # 2. Check if story should be decomposed (has incomplete tasks)
+  # 3. Spawn separate agent for each incomplete task
+  # 4. Each agent implements ONLY its assigned task
+  # 5. Update story file to mark task as [x] complete
+
+# Story type filtering - which stories require/skip tests
+story_types:
+  skip_tests:
+    - environment-setup
+    - documentation
+    - config-change
+    - dependency-update
+    - infrastructure
+    - tooling
+    - ci-cd-setup
+  require_tests:
+    - feature
+    - bugfix
+    - refactor
+    - api-change
+    - security
+    - enhancement
+
+# Knowledge Base Configuration
+# Controls how lessons learned are captured and applied
+knowledge_base:
+  enabled: true                    # Enable/disable knowledge base system
+  max_lessons_per_stage: null      # Max lessons to show per stage (null = all, 0 = all, number = limit)
+  min_encounter_count: 1           # Minimum times a lesson must be seen to be included
+
+  # Per-stage overrides (optional)
+  stage_overrides:
+    pr-checks:
+      max_lessons: 15              # Show more lessons for PR/CI fixes
+    # lint:
+    #   max_lessons: 10
+    # typecheck:
+    #   max_lessons: 15
+
+# Git Settings
+git_settings:
+  branch_prefix: "feat/"                # Branch naming prefix: "feat/", "feature/", "story/"
+  base_branch: "main"                   # Target branch for PR: "main", "master", "develop"
+  commit_message_template: |
+    {commit_type}: {story_title}
+
+    Story: {story_id}
+
+    {changes_summary}
+
+    Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+
+# PR Settings
+pr_settings:
+  auto_merge: false                    # Set to true for automatic merge after checks pass
+  merge_method: "squash"               # "squash", "merge", or "rebase"
+  delete_branch_after_merge: true      # Delete feature branch after merge
+  require_reviews: 0                   # Minimum human reviews required (0 = none)
+  wait_for_checks: true                # Wait for CI/CD checks before merge
+
+  # PR title and description templates
+  title_template: "feat: {story_title}"
+  description_template: |
+    ## Story
+    {story_id}: {story_title}
+
+    ## Changes
+    {changes_summary}
+
+    ## Checklist
+    - [x] Tests passing
+    - [x] Lint passing
+    - [x] Code reviewed by AI
+
+    🤖 Auto-generated by orchestrate-auto-dev
+
+# ============================================
+# PIPELINE STAGES (Flattened from all layers)
+# ============================================
+
+stages:
+  # ============================================
+  # STORY PREPARATION (from orchestrate-prepare)
+  # ============================================
+
+  # Stage 1: Create story if file doesn't exist
+  create-story:
+    order: 1
+    enabled: true
+    execution: spawn
+    type: bmad_workflow
+    workflow: /bmad:bmm:workflows:create-story
+    condition: story_file_not_exists
+    timeout: 3600
+    on_failure: abort
+    retry:
+      max: 2
+      fix_prompt: "Fix issues and complete story creation"
+    description: "Create story file from epics if it doesn't exist"
+    prompt: |
+      /bmad:bmm:workflows:create-story
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+
+      TASK: Create a story file for development.
+
+      INSTRUCTIONS:
+      1. Check if story_id is provided in the context above
+      2. If story_id IS provided (e.g., 2-1-timetable-creation):
+         - Read the epics file to find the corresponding epic and story
+         - Create the story file with the specific story_id
+         - Ensure file path matches project conventions
+      3. If story_id is NOT provided:
+         - Read the epics file and backlog
+         - Generate the NEXT story that needs to be implemented
+         - Assign appropriate story_id in format: {{epic}}-{{story}}-{{description}}
+         - Example: 1-2-user-authentication or 2-1-timetable-creation
+
+      STORY ID FORMAT:
+      - Use format: {{epic_number}}-{{story_number}}-{{description}}
+      - Example: 2-1-timetable-creation (NOT story-2-1-timetable-creation)
+      - Match the format used in sprint-status.yaml
+
+      OUTPUT REQUIREMENTS:
+      - Create story file in one of these locations:
+        * docs/sprint-artifacts/<story_id>.md
+        * docs/stories/<story_id>.md
+        * state/stories/<story_id>.md
+      - Include all required sections (tasks, acceptance criteria, etc.)
+      - CLEARLY OUTPUT the story_id in your response:
+        "Story ID: 2-1-timetable-creation"
+        or
+        "Created story: 2-1-timetable-creation"
+
+      IMPORTANT: Output the exact story_id clearly on its own line so it can be extracted.
+
+  # Stage 2: Validate story is ready for development
+  validate:
+    order: 2
+    enabled: true
+    execution: spawn
+    type: bmad_workflow
+    workflow: /bmad:bmm:workflows:implementation-readiness
+    timeout: 3600
+    on_failure: fix_and_retry
+    retry:
+      max: 2
+      fix_prompt: "Fix the validation issues identified in the story file"
+    description: "Validate story has clear tasks and acceptance criteria"
+    prompt: |
+      /bmad:bmm:workflows:implementation-readiness
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+
+      TASK: Validate that story {story_id} is ready for development.
+
+      Story file: {story_file}
+
+      VALIDATION CHECKLIST:
+      1. Story Structure:
+         - Has clear title and description
+         - Has "## Implementation Tasks" section
+         - Has "## Acceptance Criteria" section
+         - Has proper story ID format
+
+      2. Tasks Analysis:
+         - At least 1 task is defined
+         - Tasks are clear and actionable
+         - Tasks follow proper format (### Task N: or - [ ])
+         - Each task has clear description
+         - Dependencies between tasks are documented (if any)
+
+      3. Acceptance Criteria:
+         - At least 1 acceptance criterion defined
+         - Criteria are testable and measurable
+         - Criteria cover main functionality
+         - Success conditions are clear
+
+      4. Technical Details:
+         - Architecture decisions referenced (if applicable)
+         - Technical constraints documented (if any)
+         - Edge cases considered
+
+      5. Test Requirements:
+         - Test scenarios outlined (if story requires tests)
+         - Test data requirements specified (if needed)
+
+      INSTRUCTIONS:
+      1. Read the story file completely
+      2. Check each item in the validation checklist
+      3. Identify any missing or unclear elements
+      4. If validation FAILS:
+         - List specific issues found
+         - Suggest fixes for each issue
+         - Update the story file to fix issues
+         - Output: "FAILED: <list of issues>"
+      5. If validation PASSES:
+         - Confirm all checklist items are met
+         - Output: "PASSED: Story is ready for development"
+
+      OUTPUT REQUIREMENTS:
+      - MUST start with "PASSED:" or "FAILED:"
+      - Be explicit and clear about validation result
+      - If FAILED, list specific actionable fixes needed
+      - If PASSED, confirm story readiness
+
+      Example PASS output:
+      "PASSED: Story is ready for development. All tasks are well-defined, acceptance criteria are clear and testable."
+
+      Example FAIL output:
+      "FAILED: Missing acceptance criteria section. Task 2 is unclear about expected behavior. Need to add error handling requirements."
+
+  # ============================================
+  # DEVELOPMENT & QUALITY (from orchestrate-dev)
+  # ============================================
+
+  # Stage 3: Develop the story (RUNS IN PARALLEL with test-case-generation)
+  # NOTE: This stage uses TASK DECOMPOSITION
+  # The orchestrator will:
+  #   1. Parse story file to extract tasks (using task_decomposer.py)
+  #   2. Check if decomposition is needed (has incomplete tasks)
+  #   3. For each incomplete task, spawn a SEPARATE agent
+  #   4. Each agent implements ONLY its assigned task
+  # Result: Multiple agents, one per task (not one agent for entire story)
+  develop:
+    order: 3
+    enabled: true
+    execution: spawn_per_task  # Special execution mode for task decomposition
+    type: bmad_workflow
+    workflow: /bmad:bmm:workflows:dev-story
+    timeout: 21600  # 6 hours total for all tasks
+    task_timeout: 3600  # 1 hour per individual task
+    on_failure: fix_and_retry
+    retry:
+      max: 3
+      fix_prompt: "Continue development, addressing any issues"
+    description: "Implement story tasks (1 agent per task)"
+
+    # Prompt template for SINGLE task execution
+    # Variables: {task_index}, {task_content}, {task_title}
+    task_prompt: |
+      /bmad:bmm:workflows:dev-story
+      {autonomy}
+
+      {known_issues}
+
+      You are implementing TASK #{task_index} from story {story_id}.
+
+      Story file: {story_file}
+
+      TASK TO IMPLEMENT:
+      {task_content}
+
+      INSTRUCTIONS:
+      1. Read the story file to understand full context
+      2. Implement THIS TASK ONLY following TDD:
+         - Write tests first (red)
+         - Implement code to pass tests (green)
+         - Refactor if needed
+      3. Run tests to verify this task works
+      4. Update the story file:
+         - Mark task #{task_index} as [x] when complete
+         - Update File List with changed files
+         - Add to Change Log
+
+      DO NOT implement other tasks. Focus only on task #{task_index}.
+
+      Output:
+      - Summary of what was implemented
+      - Files changed
+      - Test results for this task
+
+    # Fallback prompt for all-at-once execution (if decomposition disabled)
+    story_prompt: |
+      /bmad:bmm:workflows:dev-story
+      {autonomy}
+
+      {known_issues}
+
+      Implement all tasks in the story file.
+      Story file: {story_file}
+      Story ID: {story_id}
+
+      Follow red-green-refactor cycle for each task.
+      Output: List of files changed and implementation summary.
+
+  # Stage 3 (parallel): Generate test cases from story (RUNS IN PARALLEL with develop)
+  test-case-generation:
+    order: 3
+    enabled: true
+    execution: spawn
+    type: bmad_workflow
+    workflow: /bmad:bmm:workflows:testarch-test-design
+    condition: story_requires_tests  # Skip for infrastructure, docs, config changes
+    timeout: 3600
+    on_failure: continue
+    blocking: false
+    description: "Generate test design matrix (TDM) in parallel with development"
+    prompt: |
+      /bmad:bmm:workflows:testarch-test-design
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+      Story File: {story_file}
+
+      You are a test architect. Generate test cases for this story.
+
+      MODE: Epic-level test planning (Implementation phase)
+
+      STEP 1: READ STORY
+      Read the story file at {story_file} to understand:
+      - Features being implemented
+      - Acceptance criteria
+      - User flows
+
+      STEP 2: GENERATE TEST DESIGN MATRIX (TDM)
+      Create test design matrix at docs/test-artifacts/{story_id}/design/tdm.yaml
+
+      Include test cases for:
+      - smoke_p0: Critical happy path tests (3-5 tests)
+      - critical_sqa_p1: Security & boundary tests (5-10 tests)
+      - extended_p2: Edge cases (optional)
+      - full_p3: Comprehensive coverage (optional)
+
+      STEP 3: PRIORITIZE FOR AUTOMATION
+      For each test case, specify:
+      - Test ID
+      - Description
+      - Priority (P0, P1, P2, P3)
+      - Test type (functional, security, boundary)
+      - Automation feasibility
+
+      Output: Path to generated TDM file
+
+  # Stage 4: Run linting
+  lint:
+    order: 4
+    enabled: true
+    execution: spawn
+    type: lint_check
+    timeout: 3600
+    on_failure: fix_and_retry
+    retry:
+      max: 3
+    description: "Discover and run all project lint checks"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+
+      You are a dev agent responsible for running ALL lint/format checks this project uses and fixing any issues.
+
+      STEP 1: DISCOVER LINT TOOLS
+      First, discover what lint/format tools this project uses by checking:
+
+      1. Read package.json scripts section - look for:
+         - "lint", "lint:fix", "eslint"
+         - "format", "format:check", "prettier"
+         - "check", "validate"
+         - Any script containing "lint", "format", "check"
+
+      2. Check for config files that indicate tools:
+         - .eslintrc.* or eslint.config.* → ESLint
+         - .prettierrc.* or prettier.config.* → Prettier
+         - biome.json or biome.jsonc → Biome
+         - .stylelintrc.* → Stylelint
+         - .markdownlint.* → Markdownlint
+
+      3. Check package.json devDependencies for:
+         - eslint, @eslint/* → ESLint
+         - prettier → Prettier
+         - @biomejs/biome → Biome
+         - stylelint → Stylelint
+         - oxlint → OxLint
+
+      STEP 2: RUN ALL LINT CHECKS
+      Run each discovered lint check command. Common patterns:
+      - npm run lint / pnpm lint / yarn lint
+      - npm run format:check / pnpm format:check
+      - npx eslint .
+      - npx prettier --check .
+      - npx biome check .
+
+      STEP 3: FIX ALL ERRORS
+      For each type of error found:
+
+      A. ESLint/OxLint errors:
+         - Read the file with errors
+         - Fix code issues (unused vars, missing imports, etc.)
+         - Use Edit tool to apply fixes
+
+      B. Prettier/Biome formatting errors:
+         - Run auto-fix command: `npx prettier --write <file>` or `npx biome format --write <file>`
+         - If auto-fix unavailable, manually fix formatting
+
+      C. Stylelint errors:
+         - Read CSS/SCSS file
+         - Fix style issues or run `npx stylelint --fix <file>`
+
+      D. Other lint errors:
+         - Read the error message carefully
+         - Check if tool has --fix flag
+         - Otherwise manually fix
+
+      STEP 4: VERIFY ALL CHECKS PASS
+      Re-run ALL discovered lint commands to ensure everything passes.
+
+      Output:
+      - List of lint tools discovered
+      - Errors found and fixed
+      - Final verification status
+
+  # Stage 5: Run type checking
+  typecheck:
+    order: 5
+    enabled: true
+    execution: spawn
+    type: quality_check
+    timeout: 3600
+    on_failure: fix_and_retry
+    retry:
+      max: 2
+      fix_agent: /bmad:bmm:agents:dev
+      fix_prompt: "Fix the TypeScript type errors shown above"
+    description: "Check TypeScript types"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+
+      You are a dev agent running typecheck and fixing TypeScript type errors.
+
+      STEP 1: RUN TYPECHECK
+      Execute: npm run typecheck
+
+      If typecheck PASSES:
+        - Output: "All type checks passed"
+        - EXIT with success
+
+      If typecheck FAILS:
+        TYPE ERRORS:
+        ```
+        {errors}
+        ```
+
+        STEP 2: FIX TYPE ERRORS
+        1. Parse the error output to identify files and line numbers with type errors
+        2. Read each file that has errors using the Read tool
+        3. Understand the type mismatch and fix the type annotations or code logic
+        4. Use the Edit tool to apply fixes
+        5. After fixing, run `npm run typecheck` to verify all errors are resolved
+
+        Common fixes:
+        - Add missing type annotations
+        - Fix incorrect types (string vs number, etc.)
+        - Add null checks for potentially undefined values
+        - Import missing type definitions
+
+      Output: Summary of files fixed and changes made.
+
+  # Stage 6: Run unit tests
+  unit-test:
+    order: 6
+    enabled: true
+    execution: spawn
+    type: test_execution
+    timeout: 3600
+    on_failure: fix_and_retry
+    retry:
+      max: 3
+      fix_agent: /bmad:bmm:agents:dev
+      fix_prompt: "Fix the failing tests shown above"
+    description: "Run all unit tests"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+
+      You are a dev agent running and fixing failing unit tests.
+
+      STEP 1: RUN UNIT TESTS
+      Execute: npm test
+
+      If tests PASS:
+        - Output: "All unit tests passed"
+        - EXIT with success
+
+      If tests FAIL:
+        TEST FAILURES:
+        ```
+        {errors}
+        ```
+
+        STEP 2: FIX TEST FAILURES
+        1. Parse the error output to identify which tests failed and why
+        2. Read the failing test file(s) using the Read tool
+        3. Read the implementation file(s) being tested
+        4. Determine if the bug is in the test or the implementation:
+           - If the test expectation is wrong, fix the test
+           - If the implementation is wrong, fix the implementation
+        5. Use the Edit tool to apply fixes
+        6. After fixing, run `npm test` to verify all tests pass
+
+        Focus on fixing ONLY the failing tests. Do not add new tests or refactor passing code.
+
+      Output: Summary of what was fixed (test or implementation) and changes made.
+
+  # Stage 7: Deploy to local dev environment (moved after quality checks)
+  deploy-local:
+    order: 7
+    enabled: true
+    execution: spawn
+    type: deployment
+    condition: story_requires_tests  # Skip for infrastructure, docs, config changes
+    timeout: 600
+    on_failure: abort
+    description: "Deploy application to local dev environment for testing"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+
+      You are a deployment agent. Deploy the application to a local development environment.
+
+      IMPORTANT: Follow architecture documentation. DO NOT guess or auto-discover.
+
+      STEP 1: CHECK ARCHITECTURE DOCUMENTATION (REQUIRED)
+      Read docs/architecture.md and look for:
+      - "Deployment" section
+      - "Running Locally" section
+      - "Development Environment" section
+      - "Getting Started" section
+
+      Extract the deployment command and expected URL from the documentation.
+
+      STEP 2: VALIDATE DEPLOYMENT METHOD
+      If architecture.md exists and has deployment instructions:
+        - Use the EXACT command documented
+        - Use the EXACT URL documented
+        - Proceed to STEP 3
+
+      If architecture.md doesn't exist OR has no deployment instructions:
+        - Check if README.md has deployment/running instructions
+        - If found, use those instructions
+        - If not found, proceed to STEP 2B
+
+      STEP 2B: TRY FALLBACK DISCOVERY (ONLY IF NO DOCUMENTATION)
+      Look for common deployment indicators:
+      - docker-compose.yml → Try: docker-compose up -d
+      - package.json with "dev" script → Try: npm run dev
+      - Makefile with "run" target → Try: make run
+
+      If found ONE clear deployment method:
+        - Proceed to STEP 3
+
+      If found MULTIPLE methods OR NONE:
+        - ABORT and output:
+          "ERROR: Cannot determine deployment method. Architecture documentation missing or unclear.
+           Please add deployment instructions to docs/architecture.md in the 'Running Locally' section.
+
+           Expected format:
+           ## Running Locally
+           \`\`\`bash
+           <deployment command>
+           \`\`\`
+           Application will be available at: <URL>
+           "
+        - EXIT with failure
+
+      STEP 3: EXECUTE DEPLOYMENT
+      Run the deployment command:
+      - If command blocks (like npm run dev), run in background using Bash with appropriate process management
+      - Capture process ID if possible
+      - Save to .orchestrate-temp/deploy-local-pid.txt
+
+      STEP 4: HEALTH CHECK
+      Wait for application to be healthy:
+      - Use the URL from architecture.md OR the discovered URL
+      - Default ports: http://localhost:3000, http://localhost:8080, http://localhost:5000
+      - Check health endpoint if documented (e.g., /health, /api/health)
+      - Wait up to 60 seconds with 5-second intervals
+      - If health check fails after 60s, ABORT with error
+
+      STEP 5: RECORD DEPLOYMENT INFO
+      Create deployment info file at .orchestrate-temp/deploy-local.txt with:
+      - Source: <architecture.md|README.md|auto-discovered>
+      - Command: <exact command used>
+      - Application URL: <url>
+      - Process ID: <pid if available>
+      - Health status: healthy
+      - Timestamp: <ISO timestamp>
+
+      Output:
+      - Source: architecture.md
+      - Deployment method: <command used>
+      - Application URL: <url>
+      - Status: healthy
+
+  # Stage 8: Code review (bumped from 7 after deploy-local moved)
+  code-review:
+    order: 9.5
+    enabled: true
+    execution: spawn
+    type: bmad_workflow
+    workflow: /bmad:bmm:workflows:code-review
+    timeout: 3600
+    on_failure: continue
+    blocking: false
+    description: "Review code quality, security, and architecture"
+    prompt: |
+      /bmad:bmm:workflows:code-review
+      {autonomy}
+
+      {known_issues}
+
+      Review the implemented code for story {story_id}.
+
+      FILES CHANGED (max 20 files, max 100KB each):
+      {files_changed}
+
+      IMPORTANT FILE LIMITS:
+      - Only up to 20 files are provided for review
+      - Files larger than 100KB are excluded
+      - Binary files are excluded
+      - If you need to review more files, use git diff or Glob/Grep tools
+
+      Review for:
+      - Code quality
+      - Security issues
+      - Performance
+      - Architecture compliance
+
+      INSTRUCTIONS:
+      1. If files_changed shows "No files changed", use git to find changed files
+      2. Focus on the most critical files first
+      3. Use Grep to search for patterns instead of reading entire large files
+      4. Prioritize security and architecture issues over style
+
+      Output: Findings with severity levels.
+
+  # ============================================
+  # TEST EXECUTION (from orchestrate-dev-test)
+  # ============================================
+
+  # Stage 7.5: Deploy to test environment
+  deploy:
+    order: 13.5
+    enabled: false  # Disabled by default - enable if you need staging deployment (some projects auto-deploy on merge via CI/CD)
+    execution: spawn
+    type: deployment
+    condition: story_requires_tests  # Skip for infrastructure, docs, config changes
+    timeout: 600
+    on_failure: abort
+    description: "Deploy application to test environment"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+
+      You are a deployment agent. Deploy the application to a test environment.
+
+      IMPORTANT: Follow architecture documentation. Do NOT guess or auto-discover.
+
+      STEP 1: CHECK ARCHITECTURE DOCUMENTATION (REQUIRED)
+      Read docs/architecture.md and look for:
+      - "Test Environment" section
+      - "Deployment" section
+      - "Testing" section with deployment info
+
+      Extract the deployment command and expected URL from the documentation.
+
+      STEP 2: VALIDATE DEPLOYMENT METHOD
+      If architecture.md exists and has test deployment instructions:
+        - Use the EXACT command documented
+        - Use the EXACT URL documented
+        - Proceed to STEP 3
+
+      If architecture.md doesn't exist OR has no test deployment instructions:
+        - ABORT and output:
+          "ERROR: Cannot determine test environment deployment method.
+           Please add test deployment instructions to docs/architecture.md.
+
+           Expected format:
+           ## Test Environment
+           \`\`\`bash
+           <deployment command>
+           \`\`\`
+           Application will be available at: <URL>
+           "
+        - EXIT with failure
+
+      STEP 3: EXECUTE DEPLOYMENT
+      Run the deployment command from architecture.md.
+
+      STEP 4: HEALTH CHECK
+      Wait for application to be healthy:
+      - Use the URL from architecture.md
+      - Check health endpoint if documented
+      - Wait up to 60 seconds
+      - If health check fails, ABORT with error
+
+      STEP 5: RECORD DEPLOYMENT INFO
+      Output:
+      - Source: architecture.md
+      - Deployment method: <command used>
+      - Application URL: <url>
+      - Health status: healthy
+
+  # Stage 7.6: Generate test scripts from TDM
+  generate-scripts:
+    order: 8
+    enabled: false  # Disabled by default - enable if you want automated script generation
+    execution: spawn
+    type: test_generation
+    condition: story_requires_tests  # Skip for infrastructure, docs, config changes
+    timeout: 600
+    on_failure: abort
+    description: "Generate executable test scripts from TDM (optional automation)"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+      TDM File: docs/test-artifacts/{story_id}/design/tdm.yaml
+
+      You are a test automation engineer. Generate executable test scripts from the TDM.
+
+      NOTE: The TDM was already generated in parallel with development at stage 3.
+      This stage converts the TDM into actual executable test code.
+
+      STEP 1: READ TDM
+      Read the Test Design Matrix at docs/test-artifacts/{story_id}/design/tdm.yaml.
+      Extract test cases for:
+      - smoke_p0 (P0 smoke tests)
+      - critical_sqa_p1 (P1 critical tests)
+
+      STEP 2: DETERMINE TEST FRAMEWORK
+      Check project for test framework:
+      - Look for jest.config.* (Jest)
+      - Look for playwright.config.* (Playwright)
+      - Look for cypress.config.* (Cypress)
+      - Check package.json dependencies
+
+      STEP 3: GENERATE SMOKE TESTS (P0)
+      For each test in smoke_p0:
+      - Create test file at docs/test-artifacts/{story_id}/scripts/smoke/*.spec.ts
+      - Follow project test conventions
+      - Include setup/teardown
+      - Use descriptive file names (e.g., test-login.spec.ts)
+
+      STEP 4: GENERATE CRITICAL SQA TESTS (P1)
+      For each test in critical_sqa_p1:
+      - Create test file at docs/test-artifacts/{story_id}/scripts/sqa/critical/*.spec.ts
+      - Include security tests
+      - Include boundary tests
+      - Use descriptive file names
+
+      STEP 5: VERIFY TEST FILES
+      Ensure all test files are syntactically valid.
+
+      Output: List of generated test files with full paths
+
+  # Stage 7.7: Run smoke tests (P0)
+  smoke-tests:
+    order: 9
+    enabled: false  # Disabled by default - enable if you have test:smoke script
+    execution: spawn
+    type: test_execution
+    condition: story_requires_tests  # Skip for infrastructure, docs, config changes
+    timeout: 600
+    on_failure: fix_and_retry
+    retry:
+      max: 3
+      fix_agent: /bmad:bmm:agents:dev
+    description: "Run P0 smoke tests"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+      Story File: {story_file}
+
+      You are a dev agent running and fixing smoke test failures.
+
+      STEP 1: RUN SMOKE TESTS
+      Execute: npm run test:smoke
+
+      If tests PASS:
+        - Output: "All smoke tests passed"
+        - EXIT with success
+
+      If tests FAIL:
+        TEST FAILURES:
+        ```
+        {errors}
+        ```
+
+        IMPORTANT: Fix the APPLICATION CODE, not the tests.
+        Smoke tests validate critical user flows.
+
+        STEP 2: ANALYZE FAILURES
+        Read the test output to understand:
+        - Which smoke tests failed
+        - Expected vs actual behavior
+        - Error messages
+
+        STEP 3: UNDERSTAND TEST EXPECTATIONS
+        Read failing test files at docs/test-artifacts/{story_id}/scripts/smoke/
+        to understand what the tests expect.
+
+        STEP 4: IDENTIFY ROOT CAUSE
+        Common smoke test failures:
+        - Missing functionality
+        - API response format mismatch
+        - Validation errors
+        - Edge cases not handled
+
+        STEP 5: FIX THE CODE
+        - Read the relevant source files
+        - Apply fixes to make tests pass
+        - Use Edit tool to modify files
+
+        STEP 6: COMMIT AND PUSH
+        After fixing:
+        - git add <changed files>
+        - git commit -m "fix: resolve smoke test failures for {story_id}"
+        - git push
+
+      Output: Summary of fixes applied
+
+  # Stage 7.8: Run critical SQA tests (P1)
+  critical-sqa:
+    order: 13.6
+    enabled: false  # Disabled by default - enable if you have test:sqa:critical script (runs after staging deploy)
+    execution: spawn
+    type: test_execution
+    condition: story_requires_tests  # Skip for infrastructure, docs, config changes
+    timeout: 900
+    on_failure: fix_and_retry
+    retry:
+      max: 3
+      fix_agent: /bmad:bmm:agents:dev
+    description: "Run P1 critical SQA tests (security & boundary)"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+      Story File: {story_file}
+
+      You are a dev agent running and fixing critical SQA test failures.
+
+      STEP 1: RUN CRITICAL SQA TESTS
+      Execute: npm run test:sqa:critical
+
+      If tests PASS:
+        - Output: "All critical SQA tests passed"
+        - EXIT with success
+
+      If tests FAIL:
+        TEST FAILURES:
+        ```
+        {errors}
+        ```
+
+        IMPORTANT: Fix the APPLICATION CODE, not the tests.
+        These are security and boundary tests - they MUST pass.
+
+        STEP 2: ANALYZE FAILURES
+        Read the test output to understand:
+        - Which security/boundary tests failed
+        - Error messages and stack traces
+
+        STEP 3: UNDERSTAND TEST EXPECTATIONS
+        Read failing test files at docs/test-artifacts/{story_id}/scripts/sqa/critical/
+        to understand security requirements and boundary conditions.
+
+        STEP 4: IDENTIFY ROOT CAUSE
+        Common SQA issues:
+        - Input sanitization missing (XSS, SQL injection)
+        - Output encoding missing
+        - Validation bypassed or insufficient
+        - Boundary checks missing (min/max values)
+        - Error handling inadequate
+        - Authentication/authorization gaps
+
+        STEP 5: FIX THE CODE
+        Apply appropriate fixes:
+        - Add/fix input validation
+        - Add/fix output encoding
+        - Add/fix boundary checks
+        - Improve error handling
+        - DO NOT modify the test scripts
+
+        STEP 6: COMMIT AND PUSH
+        After fixing:
+        - git add <changed files>
+        - git commit -m "fix(security): resolve critical SQA failures for {story_id}"
+        - git push
+
+      Output: Summary of root cause and fixes applied
+
+  # ============================================
+  # GIT & PR AUTOMATION (from orchestrate-integrate)
+  # ============================================
+
+  # Stage 9: Create git commit
+  git-commit:
+    order: 10
+    enabled: true
+    execution: spawn
+    type: git_operation
+    timeout: 3600
+    on_failure: fix_and_retry
+    retry:
+      max: 2
+    description: "Create git commit with AI-generated message"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+      Story File: {story_file}
+
+      You are a git operations agent. Create a commit for the changes made.
+
+      STEP 1: Read story file
+      Read {story_file} to get the story title and determine commit type.
+
+      Determine commit type based on story:
+      - feat: New feature
+      - fix: Bug fix
+      - refactor: Code refactoring
+      - docs: Documentation
+      - test: Test changes
+      - chore: Build/tooling changes
+
+      STEP 2: Check git status
+      Run `git status` to see what files have changed.
+
+      STEP 3: Stage changes
+      Stage all relevant files using `git add <files>`.
+      Do NOT stage:
+      - .env files
+      - credentials
+      - node_modules
+      - .DS_Store
+      - temp files
+
+      STEP 4: Generate commit message
+      Create a conventional commit message following this template:
+
+      <commit_type>: <story_title>
+
+      Story: {story_id}
+
+      Summary of changes (2-3 sentences)
+
+      Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+
+      STEP 5: Create commit
+      Run `git commit -m "your message"` (use heredoc for multiline).
+
+      STEP 6: Verify
+      Run `git log -1` to verify commit was created.
+
+      Output: Commit hash and message
+
+  # Stage 9: Push to remote
+  git-push:
+    order: 11
+    enabled: true
+    execution: spawn
+    type: git_operation
+    timeout: 3600
+    on_failure: fix_and_retry
+    retry:
+      max: 2
+    description: "Push changes to remote feature branch"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+
+      You are a git operations agent. Push changes to remote.
+
+      STEP 1: Check current branch
+      Run `git branch --show-current` to see current branch name.
+
+      STEP 2: Create feature branch if needed
+      If current branch is main or master:
+        - Create feature branch: `git checkout -b feat/{story_id}`
+      Otherwise:
+        - Use existing branch
+
+      STEP 3: Ensure branch is tracking remote
+      Run `git push -u origin <branch_name>` to push and set upstream.
+
+      STEP 4: Verify
+      Run `git status` to verify push was successful.
+
+      Output: Branch name and remote URL
+
+  # Stage 10: Create pull request
+  pr-create:
+    order: 12
+    enabled: true
+    execution: spawn
+    type: pr_operation
+    timeout: 3600
+    on_failure: fix_and_retry
+    retry:
+      max: 2
+    description: "Create pull request with AI-generated description"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+      Story file: {story_file}
+
+      You are a PR operations agent. Create a pull request using GitHub CLI.
+
+      PREREQUISITES:
+      Ensure `gh` CLI is installed and authenticated:
+      - Run `gh auth status` to check authentication
+      - If not authenticated, output error and abort
+
+      STEP 1: Read story file
+      Read {story_file} to get story title and description.
+
+      STEP 2: Get changes summary
+      Run `git diff main...HEAD --stat` to get changes summary.
+
+      STEP 3: Generate PR title and description
+      Title: "feat: <story title>"
+      Description:
+        ## Story
+        {story_id}: <story title>
+
+        ## Changes
+        <summary of what changed>
+
+        ## Checklist
+        - [x] Tests passing
+        - [x] Lint passing
+        - [x] Code reviewed by AI
+
+        🤖 Auto-generated by orchestrate-auto-dev
+
+      STEP 4: Create PR
+      Run `gh pr create --title "..." --body "..." --base main`.
+
+      STEP 5: Get PR URL
+      Parse output to extract PR number and URL.
+
+      Output: PR number and URL
+
+  # Stage 11: Monitor PR checks (with auto-fix loop)
+  pr-checks:
+    order: 13
+    enabled: true
+    execution: spawn
+    type: pr_operation
+    timeout: 10800  # 3 hours (includes fix loop)
+    on_failure: fix_and_retry
+    retry:
+      max: 5                         # Up to 5 fix attempts
+    description: "Monitor CI/CD checks and auto-fix failures"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+      PR number: {pr_number}
+      PR URL: {pr_url}
+
+      You are a PR operations agent. Monitor CI/CD checks and auto-fix any failures.
+
+      MAIN LOOP (run until all checks pass or max time/retries):
+
+      STEP 1: Check PR status
+      Run `gh pr checks {pr_number}` to get current check status.
+
+      STEP 2: Parse results
+      Check if all checks are:
+      - ✓ PASS → Exit successfully
+      - ⏳ PENDING → Wait 60 seconds, go to STEP 1
+      - ✗ FAIL → Continue to STEP 3
+
+      STEP 3: Get failure logs (if any checks failed)
+      For each failed check:
+      - Run `gh pr checks {pr_number} --watch` or `gh run view <run_id> --log`
+      - Extract error messages and failure reasons
+
+      STEP 4: Analyze failures
+      Common CI/CD failures:
+      - Lint errors → Run lint fix agent
+      - Test failures → Run test fix agent
+      - Build errors → Run build fix agent
+      - Dependency issues → Update dependencies
+      - Timeout errors → Optimize tests
+
+      STEP 5: Auto-fix
+      Spawn appropriate fix agent with failure logs:
+      - Read files mentioned in errors
+      - Apply fixes using Edit tool
+      - Commit and push fixes
+
+      STEP 6: Wait for re-run
+      After pushing fixes:
+      - CI/CD will automatically re-run
+      - Wait 60 seconds
+      - Go to STEP 1
+
+      MAX RETRIES: 5 fix attempts
+      TIMEOUT: 3 hours total
+
+      If max retries or timeout reached:
+      - Output: "CI/CD checks failed after max attempts"
+      - Provide PR URL for manual intervention
+
+      Output: Final check status (all passed or failed with details)
+
+  # Stage 11.5: Run full SQA tests (P2-P3) - OPTIONAL
+  # NOTE: Enable this only if you have "test:sqa:full" script in package.json
+  # This runs extended test suite (P2-P3) after PR checks pass
+  full-sqa:
+    order: 15
+    enabled: false  # Disabled by default - enable if you have the test script (runs after PR merge)
+    execution: spawn
+    type: test_execution
+    condition: story_requires_tests  # Skip for infrastructure, docs, config changes
+    timeout: 10800  # 3 hours
+    on_failure: fix_and_retry
+    retry:
+      max: 3
+      fix_agent: /bmad:bmm:agents:dev
+    description: "Run P2-P3 full SQA tests (optional - requires test:sqa:full script)"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+      Story ID: {story_id}
+
+      You are a dev agent running and fixing full SQA test failures.
+
+      STEP 1: RUN FULL SQA TESTS
+      Execute: npm run test:sqa:full
+
+      If tests PASS:
+        - Output: "All full SQA tests passed"
+        - EXIT with success
+
+      If tests FAIL:
+        TEST FAILURES:
+        ```
+        {errors}
+        ```
+
+        IMPORTANT: Fix the APPLICATION CODE, not the tests.
+        These are P2-P3 extended tests that catch additional edge cases.
+
+        STEP 2: ANALYZE FAILURES
+        Read the test output to understand:
+        - Which tests failed (P2 edge cases or P3 extended tests)
+        - Expected vs actual behavior
+        - Error messages
+
+        STEP 3: IDENTIFY ROOT CAUSE
+        Common causes for P2-P3 failures:
+        - Edge case handling
+        - Performance issues
+        - Accessibility problems
+        - Complex state transitions
+
+        STEP 4: FIX THE CODE
+        - Read the relevant source files
+        - Apply fixes to make tests pass
+        - Use Edit tool to modify files
+
+        STEP 5: COMMIT AND PUSH
+        After fixing:
+        - git add <changed files>
+        - git commit -m "fix: address P2-P3 test failures for {story_id}"
+        - git push
+
+      Output: Summary of fixes applied
+
+  # Stage 12: Merge pull request (configurable)
+  pr-merge:
+    order: 14
+    enabled: true
+    execution: spawn
+    type: pr_operation
+    condition: pr_checks_passed       # Only run if checks passed
+    timeout: 3600
+    on_failure: fix_and_retry
+    retry:
+      max: 1
+    description: "Merge PR (auto or prepare for manual)"
+    prompt: |
+      {autonomy}
+
+      {known_issues}
+
+      PROJECT ROOT: {project_root}
+      PR number: {pr_number}
+      PR URL: {pr_url}
+      Auto-merge: {auto_merge}
+      Merge method: {merge_method}
+
+      You are a PR operations agent. Handle PR merge based on configuration.
+
+      CONFIG CHECK:
+      Auto-merge setting: {auto_merge}
+
+      IF auto_merge = false:
+        SKIP MERGE, PREPARE FOR MANUAL REVIEW:
+
+        STEP 1: Verify PR is ready
+        Run `gh pr checks {pr_number}` to confirm all checks passed.
+
+        STEP 2: Output information for manual review
+        Output:
+        - ✓ PR is ready for manual review
+        - PR URL: {pr_url}
+        - All CI/CD checks: PASSED
+        - Please review and merge manually on GitHub
+
+        EXIT with status: "ready_for_manual_merge"
+
+      IF auto_merge = true:
+        AUTO-MERGE PR:
+
+        STEP 1: Verify merge requirements
+        - All CI/CD checks passed
+        - No merge conflicts
+        - Branch is up to date with main
+
+        STEP 2: Check for conflicts
+        Run `gh pr view {pr_number} --json mergeable` to check if mergeable.
+        If conflicts exist:
+          - Output error: "Merge conflicts detected, cannot auto-merge"
+          - EXIT with failure
+
+        STEP 3: Merge PR
+        Run `gh pr merge {pr_number} --{merge_method} --auto`.
+
+        Merge methods:
+        - squash: Squash all commits into one
+        - merge: Standard merge commit
+        - rebase: Rebase and merge
+
+        STEP 4: Delete branch (if configured)
+        If delete_branch_after_merge = true:
+          Run `gh pr close {pr_number}` (gh pr merge already deletes branch)
+
+        STEP 5: Verify merge
+        Run `gh pr view {pr_number} --json state,merged` to verify merged.
+
+        Output: Merge status and final commit hash
+
+# Output variables captured from execution
+output:
+  - story_id
+  - story_file
+  - files_changed
+  - lint_result
+  - typecheck_result
+  - test_results
+  - review_findings
+  - commit_hash
+  - branch_name
+  - pr_number
+  - pr_url
+  - pr_status
+  - merge_status
+  - status

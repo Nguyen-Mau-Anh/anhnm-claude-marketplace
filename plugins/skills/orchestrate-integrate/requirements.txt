@@ -1,4 +1,0 @@
-rich>=13.7.0
-typer>=0.9.0
-pydantic>=2.5.0
-pyyaml>=6.0.1

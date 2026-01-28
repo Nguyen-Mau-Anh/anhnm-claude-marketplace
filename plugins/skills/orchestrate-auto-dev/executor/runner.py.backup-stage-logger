@@ -1,0 +1,3309 @@
+"""Pipeline runner for orchestrate-auto-dev.
+
+Complete story-to-PR pipeline with all stages flattened:
+- Story preparation (create, validate)
+- Development & quality (develop, lint, typecheck, test, code-review)
+- Git & PR automation (commit, push, create PR, check PR, merge)
+
+IMPORTANT: The orchestrator ONLY coordinates and spawns agents.
+It NEVER executes tasks directly in its own context.
+All work is done by spawned agents.
+"""
+
+import re
+import subprocess
+import sys
+import time
+import yaml
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple
+from dataclasses import dataclass, field
+
+# Add skill root to path so we can import _common as a package
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Import from executor/config.py (local) - use relative import
+from .config import AutoDevConfig
+
+# Import from _common package (using package notation to support relative imports within _common)
+from _common.config_loader import ConfigLoader, StageConfig
+from _common.spawner import ClaudeSpawner, TaskResult, BackgroundTask, TaskStatus
+from _common.knowledge_base import KnowledgeBase, classify_error, extract_error_pattern
+from _common.logger import Logger, LogLevel
+from _common.task_decomposer import (
+    parse_story_tasks,
+    should_decompose,
+    get_incomplete_tasks,
+    format_task_for_agent,
+    format_tasks_summary,
+)
+from _common.status_manager import StatusManager
+from _common.file_utils import safe_read, safe_write
+from _common.validators import validate_story_id, validate_file_exists
+
+# Define Task if not exported
+@dataclass
+class Task:
+    """Task definition for task decomposition."""
+    id: str
+    description: str
+    completed: bool = False
+
+
+def log(msg: str) -> None:
+    """Print with immediate flush for background visibility."""
+    print(msg, flush=True)
+
+
+@dataclass
+class PipelineResult:
+    """Result of the entire pipeline execution."""
+    success: bool
+    story_id: Optional[str] = None
+    story_file: Optional[str] = None
+    branch_name: Optional[str] = None
+    pr_url: Optional[str] = None
+    files_changed: List[str] = field(default_factory=list)
+    stage_results: Dict[str, str] = field(default_factory=dict)
+    error: Optional[str] = None
+
+
+class AutoDevRunner:
+    """
+    Execute automated development pipeline with all stages flattened.
+
+    CRITICAL: This orchestrator ONLY spawns agents and coordinates.
+    It NEVER executes any development tasks in its own context.
+    All work is done by spawned agents.
+    """
+
+    def __init__(self, project_root: Path, logger: Optional[Logger] = None):
+        self.project_root = Path(project_root)
+        # Create logger with proper signature - just name is required
+        self.logger = logger or Logger(name="orchestrate-auto-dev")
+        # ConfigLoader needs config_class and skill_name
+        self.config_loader = ConfigLoader(
+            project_root,
+            config_class=AutoDevConfig,
+            skill_name="orchestrate-auto-dev",
+            logger=self.logger
+        )
+        self.spawner = ClaudeSpawner(project_root, logger=self.logger)
+        # KnowledgeBase only takes project_root
+        self.knowledge = KnowledgeBase(project_root)
+        # StatusManager takes project_root and skill_name
+        self.status_manager = StatusManager(project_root, skill_name="orchestrate-auto-dev")
+        self.config: Optional[AutoDevConfig] = None
+        self.story_id: Optional[str] = None
+        self.story_file: Optional[Path] = None
+        self.branch_name: Optional[str] = None
+        self.pr_url: Optional[str] = None
+        self._stage_loggers: Dict[str, Logger] = {}  # Cache stage loggers
+
+    def _get_stage_logger(self, stage_name: str, story_id: Optional[str] = None) -> Logger:
+        """
+        Get or create a stage-specific logger.
+
+        Creates log files at: .orchestrate-temp/logs/stories/{story_id}/{stage_name}.log
+
+        Args:
+            stage_name: Name of the stage (e.g., "create-story", "develop", "lint")
+            story_id: Story identifier (uses self.story_id if not provided)
+
+        Returns:
+            Logger instance for the stage
+        """
+        # Use provided story_id or fall back to self.story_id or "unknown"
+        actual_story_id = story_id or self.story_id or "unknown"
+
+        # Create cache key
+        cache_key = f"{actual_story_id}:{stage_name}"
+
+        # Return cached logger if exists
+        if cache_key in self._stage_loggers:
+            return self._stage_loggers[cache_key]
+
+        # Create new stage logger
+        stage_logger = Logger.for_stage(
+            stage_name=stage_name,
+            story_id=actual_story_id,
+            project_root=self.project_root,
+            level=LogLevel.INFO
+        )
+
+        # Cache it
+        self._stage_loggers[cache_key] = stage_logger
+
+        return stage_logger
+
+    def _get_knowledge_limit(self, stage_name: str) -> Optional[int]:
+        """
+        Get max lessons limit from config for a stage.
+
+        Returns:
+            None = load all lessons
+            int = limit to N lessons
+        """
+        if not self.config:
+            return None
+
+        kb_config = self.config.knowledge_base
+
+        if not kb_config.enabled:
+            return 0
+
+        # Check for per-stage override
+        if kb_config.stage_overrides and stage_name in kb_config.stage_overrides:
+            stage_limit = kb_config.stage_overrides[stage_name].get('max_lessons')
+            if stage_limit == 0 or stage_limit is None:
+                return None
+            return stage_limit
+
+        # Get global limit
+        global_limit = kb_config.max_lessons_per_stage
+        if global_limit == 0 or global_limit is None:
+            return None
+
+        return global_limit
+
+    def run(self, story_id: Optional[str] = None) -> PipelineResult:
+        """Run the complete automated development pipeline."""
+        result = PipelineResult(success=False)
+
+        try:
+            # Step 0: Load config
+            log("\n=== Step 0: Loading configuration ===")
+            self.config = self.config_loader.load()
+            self.spawner.set_config(self.config)
+            log(f"  Config: {self.config.name} v{self.config.version}")
+
+            # Step 1: Create story (if needed)
+            log("\n=== Step 1: Story Creation ===")
+            if not story_id:
+                log("  No story ID provided, will create new story")
+                passed, task_output = self._run_create_story_stage()
+                result.stage_results["create-story"] = "PASS" if passed else "FAIL"
+                if not passed and not self._is_disabled("create-story"):
+                    result.error = "Story creation failed"
+                    return result
+
+                # Extract story_id from agent output
+                if task_output:
+                    # Note: story_id is None here, so no hint available
+                    story_id = self._extract_story_id_from_output(task_output, hint_story_id=None)
+                    if story_id:
+                        self.story_id = story_id
+                        # Update status: story created → "drafted"
+                        self._update_story_status(story_id, "drafted")
+                    else:
+                        log("  WARNING: Could not extract story_id from agent output")
+
+                if not story_id:
+                    result.error = "Could not determine story_id after creation"
+                    return result
+            else:
+                log(f"  Story ID provided: {story_id}")
+                # Check if story exists
+                story_file = self.config_loader.find_story_file(story_id, self.config)
+                if not story_file:
+                    log("  Story file not found, will create")
+                    passed, task_output = self._run_create_story_stage(story_id=story_id)
+                    result.stage_results["create-story"] = "PASS" if passed else "FAIL"
+                    if not passed:
+                        result.error = "Story creation failed"
+                        return result
+                    # Update status: story created → "drafted"
+                    self._update_story_status(story_id, "drafted")
+                else:
+                    log(f"  Story file found: {story_file}")
+                    result.stage_results["create-story"] = "SKIP"
+
+            # Store story info
+            self.story_id = story_id
+            self.story_file = self.config_loader.find_story_file(story_id, self.config)
+            result.story_id = story_id
+            result.story_file = str(self.story_file) if self.story_file else None
+
+            if not self.story_file:
+                result.error = "Story file not found"
+                return result
+
+            log(f"  Story: {self.story_id}")
+            log(f"  File: {self.story_file}")
+
+            # Step 2: Validate story
+            log("\n=== Step 2: Validating story ===")
+            passed, validation_output = self._run_validate_stage(story_id, str(self.story_file))
+            result.stage_results["validate"] = "PASS" if passed else "SKIP" if self._is_disabled("validate") else "FAIL"
+            if not passed and not self._is_disabled("validate") and self._should_abort("validate"):
+                result.error = "Story validation failed"
+                return result
+
+            # Update status: story validated → "ready-for-dev"
+            if passed:
+                self._update_story_status(story_id, "ready-for-dev")
+
+            # Step 3: Develop story (with task decomposition) + Test Case Generation (parallel)
+            log("\n=== Step 3: Development + Test Case Generation (Parallel) ===")
+            # Update status: story → in-progress
+            self._update_story_status(story_id, "in-progress")
+
+            # Start test-case-generation in parallel (spawn but don't wait yet)
+            test_gen_task = None
+            test_gen_enabled = not self._is_disabled("test-case-generation")
+
+            if test_gen_enabled:
+                log("  🚀 Spawning test-case-generation agent (parallel, non-blocking)...")
+                try:
+                    # Pre-validate test-case-generation
+                    is_valid, validation_msg = self._pre_validate_test_case_generation(story_id, str(self.story_file))
+                    if is_valid:
+                        # Get stage config and spawn background task
+                        stage_config = self.config.stages.get("test-case-generation")
+                        if stage_config:
+                            limit = self._get_knowledge_limit("test-case-generation")
+                            lessons = self.knowledge.get_lessons_for_stage("test-case-generation", limit=limit)
+
+                            kwargs = {
+                                'stage_name': "test-case-generation",
+                                'story_id': story_id,
+                                'story_file': str(self.story_file),
+                                'autonomy': self.config.autonomy_instructions,
+                                'project_root': str(self.project_root),
+                                'known_issues': self.knowledge.format_for_prompt(lessons) if lessons else "",
+                            }
+
+                            test_gen_task = self.spawner.spawn_stage(
+                                stage_config,
+                                background=True,
+                                **kwargs
+                            )
+                            log(f"  ✅ Test-case-generation agent spawned in background")
+                        else:
+                            log(f"  ⚠ test-case-generation stage config not found")
+                    else:
+                        log(f"  ⚠ Skipping test-case-generation: {validation_msg}")
+                except Exception as e:
+                    log(f"  ⚠ Failed to spawn test-case-generation: {e}")
+                    test_gen_task = None
+            else:
+                log("  test-case-generation: DISABLED")
+
+            # Run develop stage (synchronous, blocking)
+            log("\n  Starting develop stage (blocking)...")
+            # Check if task decomposition is enabled
+            decomp_enabled = (
+                self.config.task_decomposition.enabled
+                if hasattr(self.config, 'task_decomposition') else False
+            )
+
+            if decomp_enabled:
+                log("  Task decomposition: ENABLED (1 agent per task)")
+                passed = self._run_develop_with_decomposition(story_id, str(self.story_file))
+            else:
+                log("  Task decomposition: DISABLED (1 agent for entire story)")
+                passed = self._run_stage("develop", story_id=story_id, story_file=str(self.story_file))
+
+            result.stage_results["develop"] = "PASS" if passed else "SKIP" if self._is_disabled("develop") else "FAIL"
+            if not passed and not self._is_disabled("develop") and self._should_abort("develop"):
+                result.error = "Development failed"
+                return result
+
+            # Check test-case-generation result (if it was spawned)
+            if test_gen_task:
+                log("\n  Checking test-case-generation result (parallel task)...")
+                try:
+                    test_result = self._wait_for_task(test_gen_task, "test-case-generation")
+
+                    if test_result.success:
+                        # Health check TDM file
+                        health_passed, health_msg = self._verify_tdm_created(story_id)
+                        if health_passed:
+                            log(f"  ✅ Test case generation completed successfully")
+                            log(f"  {health_msg}")
+                            result.stage_results["test-case-generation"] = "PASS"
+                        else:
+                            log(f"  ⚠ Test case generation completed but health check failed: {health_msg}")
+                            result.stage_results["test-case-generation"] = "FAIL"
+                    else:
+                        log(f"  ⚠ Test case generation failed (non-blocking)")
+                        result.stage_results["test-case-generation"] = "FAIL"
+                except Exception as e:
+                    log(f"  ⚠ Error checking test-case-generation result: {e}")
+                    result.stage_results["test-case-generation"] = "FAIL"
+            elif test_gen_enabled:
+                result.stage_results["test-case-generation"] = "SKIP"
+            else:
+                result.stage_results["test-case-generation"] = "SKIP"
+
+            # Note: test-case-generation has on_failure=continue, so failures don't abort pipeline
+
+            # Step 4: Lint (enhanced)
+            log("\n=== Step 4: Running lint ===")
+            if not self._is_disabled("lint"):
+                passed, _ = self._run_lint_stage(story_id, str(self.story_file))
+                result.stage_results["lint"] = "PASS" if passed else "FAIL"
+                if not passed and self._should_abort("lint"):
+                    result.error = "Lint failed"
+                    return result
+            else:
+                log("  lint: DISABLED")
+                result.stage_results["lint"] = "SKIP"
+
+            # Step 5: Typecheck (enhanced)
+            log("\n=== Step 5: Running typecheck ===")
+            if not self._is_disabled("typecheck"):
+                passed, _ = self._run_typecheck_stage(story_id, str(self.story_file))
+                result.stage_results["typecheck"] = "PASS" if passed else "FAIL"
+                if not passed and self._should_abort("typecheck"):
+                    result.error = "Typecheck failed"
+                    return result
+            else:
+                log("  typecheck: DISABLED")
+                result.stage_results["typecheck"] = "SKIP"
+
+            # Step 6: Unit tests (enhanced)
+            log("\n=== Step 6: Running unit tests ===")
+            if not self._is_disabled("unit-test"):
+                passed, _ = self._run_unit_test_stage(story_id, str(self.story_file))
+                result.stage_results["unit-test"] = "PASS" if passed else "FAIL"
+                if not passed and self._should_abort("unit-test"):
+                    result.error = "Unit tests failed"
+                    return result
+            else:
+                log("  unit-test: DISABLED")
+                result.stage_results["unit-test"] = "SKIP"
+
+            # Step 7: Deploy local (enhanced, moved from 3.3)
+            log("\n=== Step 7: Deploying to local environment ===")
+            if not self._is_disabled("deploy-local"):
+                passed, deploy_output = self._run_deploy_local_stage(story_id, str(self.story_file))
+                if passed:
+                    result.stage_results["deploy-local"] = "PASS"
+                elif deploy_output and "Skipped" in deploy_output:
+                    result.stage_results["deploy-local"] = "SKIP"
+                else:
+                    result.stage_results["deploy-local"] = "FAIL"
+
+                if (not passed and deploy_output and "Skipped" not in deploy_output and
+                    self._should_abort("deploy-local")):
+                    result.error = "Local deployment failed"
+                    return result
+            else:
+                log("  deploy-local: DISABLED")
+                result.stage_results["deploy-local"] = "SKIP"
+
+            # Step 8: Code review (enhanced)
+            log("\n=== Step 8: Running code review ===")
+            files_changed_list = self._get_changed_files(limit=20)
+            result.files_changed = files_changed_list
+            if not self._is_disabled("code-review"):
+                passed, review_output = self._run_code_review_stage(story_id, str(self.story_file), files_changed_list)
+                result.stage_results["code-review"] = "PASS" if passed and review_output != "FAIL" else "SKIP" if review_output == "SKIP" else "FAIL"
+                # Code review is non-blocking (on_failure: continue)
+            else:
+                log("  code-review: DISABLED")
+                result.stage_results["code-review"] = "SKIP"
+
+            # Step 9: Git commit
+            log("\n=== Step 9: Creating git commit ===")
+            passed = self._run_stage("git-commit", story_id=story_id)
+            result.stage_results["git-commit"] = "PASS" if passed else "SKIP" if self._is_disabled("git-commit") else "FAIL"
+            if not passed and not self._is_disabled("git-commit") and self._should_abort("git-commit"):
+                result.error = "Git commit failed"
+                return result
+
+            # Step 10: Git push
+            log("\n=== Step 10: Pushing to remote ===")
+            passed = self._run_stage("git-push", story_id=story_id)
+            result.stage_results["git-push"] = "PASS" if passed else "SKIP" if self._is_disabled("git-push") else "FAIL"
+            if not passed and not self._is_disabled("git-push") and self._should_abort("git-push"):
+                result.error = "Git push failed"
+                return result
+
+            # Extract branch name for PR
+            self.branch_name = self._get_current_branch()
+            result.branch_name = self.branch_name
+
+            # Step 11: Create PR
+            log("\n=== Step 11: Creating pull request ===")
+            passed = self._run_stage(
+                "pr-create",
+                story_id=story_id,
+                branch_name=self.branch_name,
+                base_branch=self.config.git_settings.base_branch
+            )
+            result.stage_results["pr-create"] = "PASS" if passed else "SKIP" if self._is_disabled("pr-create") else "FAIL"
+            if not passed and not self._is_disabled("pr-create") and self._should_abort("pr-create"):
+                result.error = "PR creation failed"
+                return result
+
+            # Extract PR URL
+            self.pr_url = self._get_pr_url(self.branch_name)
+            result.pr_url = self.pr_url
+
+            # Step 12: PR checks
+            log("\n=== Step 12: Waiting for PR checks ===")
+            passed = self._run_stage(
+                "pr-checks",
+                story_id=story_id,
+                pr_url=self.pr_url,
+                branch_name=self.branch_name
+            )
+            result.stage_results["pr-checks"] = "PASS" if passed else "SKIP" if self._is_disabled("pr-checks") else "FAIL"
+            if not passed and not self._is_disabled("pr-checks") and self._should_abort("pr-checks"):
+                result.error = "PR checks failed"
+                return result
+
+            # Step 13: PR merge (optional)
+            if self.config.pr_settings.auto_merge:
+                log("\n=== Step 13: Merging pull request ===")
+                passed = self._run_stage(
+                    "pr-merge",
+                    story_id=story_id,
+                    pr_url=self.pr_url,
+                    merge_method=self.config.pr_settings.merge_method,
+                    delete_branch=self.config.pr_settings.delete_branch_after_merge
+                )
+                result.stage_results["pr-merge"] = "PASS" if passed else "SKIP" if self._is_disabled("pr-merge") else "FAIL"
+            else:
+                log("\n=== Step 13: PR merge skipped (auto_merge disabled) ===")
+                result.stage_results["pr-merge"] = "SKIP"
+
+            # Determine overall success
+            failed_stages = [s for s, status in result.stage_results.items() if status == "FAIL"]
+            result.success = len(failed_stages) == 0
+
+            self._print_summary(result)
+            return result
+
+        except Exception as e:
+            result.error = str(e)
+            log(f"\n!!! Pipeline failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return result
+
+    def _should_abort(self, stage_name: str) -> bool:
+        """Check if pipeline should abort on stage failure."""
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            return True
+        return stage_config.on_failure == "abort"
+
+    def _extract_story_id_from_output(self, output: str, hint_story_id: Optional[str] = None) -> Optional[str]:
+        """
+        Extract story_id from agent output.
+
+        Uses orchestrate-prepare's proven approach:
+        1. Look for "story_id: X" or "Story ID: X" pattern
+        2. Fall back to hint_story_id if provided
+        3. Look for story ID in file path (X.md)
+
+        Supports format: 1-2-user-auth or 2-1-timetable-creation
+
+        Args:
+            output: Agent output text
+            hint_story_id: Optional story_id that was passed to agent (fallback)
+
+        Returns:
+            Extracted story_id or None if not found
+        """
+        import re
+
+        story_id = None
+
+        # Pattern 1: "story_id: X" or "Story ID: X" (case-insensitive)
+        # Matches: story_id:, story id:, Story ID:, STORY_ID:, etc.
+        match = re.search(r'story[_\s]id:\s*([0-9]+-[0-9]+-[a-z0-9-]+)', output, re.IGNORECASE)
+        if match:
+            story_id = match.group(1)
+            log(f"  Extracted story_id from output: {story_id}")
+            return story_id
+
+        # Pattern 2: Use hint if provided (the story_id we asked agent to create)
+        if hint_story_id:
+            log(f"  Using provided story_id as fallback: {hint_story_id}")
+            return hint_story_id
+
+        # Pattern 3: Look for story ID in file path (e.g., "2-1-timetable-creation.md")
+        match = re.search(r'([0-9]+-[0-9]+-[a-z0-9-]+)\.md', output)
+        if match:
+            story_id = match.group(1)
+            log(f"  Extracted story_id from file path: {story_id}")
+            return story_id
+
+        log("  Could not extract story_id from output")
+        return None
+
+    def _run_create_story_stage(self, story_id: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+        """
+        Run create-story stage by spawning agent.
+
+        Enhanced with:
+        - Comprehensive logging at each step
+        - Story ID validation (if provided)
+        - Story file health check after creation
+        - Detailed error classification
+        - Knowledge base integration
+
+        Args:
+            story_id: Optional story_id to create (if known)
+
+        Returns:
+            Tuple of (success, output)
+        """
+        stage_name = "create-story"
+        stage_logger = self._get_stage_logger(stage_name, story_id)
+
+        self.logger.info("="*60)
+        self.logger.info(f"STAGE: {stage_name}")
+        self.logger.info("="*60)
+
+        # Stage config validation
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            self.logger.warn(f"  ⚠️  No config for {stage_name}, skipping")
+            return True, None
+
+        if not stage_config.enabled:
+            self.logger.info(f"  ℹ️  {stage_name} is disabled, skipping")
+            return True, None
+
+        # Validate story_id if provided
+        if story_id:
+            self.logger.info(f"  Validating story_id: {story_id}")
+            is_valid, error_msg = validate_story_id(story_id)
+            if not is_valid:
+                self.logger.error(f"  ❌ Story ID validation failed: {error_msg}")
+                # Capture lesson about validation failure
+                self.knowledge.add_lesson(
+                    stage=stage_name,
+                    error_type="validation_error",
+                    error_pattern=f"Invalid story_id format: {story_id}",
+                    error_message=error_msg,
+                    context={"story_id": story_id},
+                    fix={"description": "Use valid story_id format: story-EPIC-NUM-slug"},
+                    success=False,
+                    story_id=story_id
+                )
+                return False, None
+            self.logger.info(f"  ✓ Story ID validated")
+
+        max_retries = stage_config.retry.max if stage_config.retry else 0
+        self.logger.info(f"  Retry policy: max {max_retries} retries, on_failure={stage_config.on_failure}")
+
+        # Get relevant lessons from knowledge base
+        self.logger.info(f"  Querying knowledge base for lessons...")
+        limit = self._get_knowledge_limit(stage_name)
+        lessons = self.knowledge.get_lessons_for_stage(stage_name, limit=limit)
+        lesson_ids = [l["id"] for l in lessons]
+
+        if lessons:
+            self.logger.info(f"  📚 Found {len(lessons)} lesson(s) from previous runs:")
+            for lesson in lessons[:3]:  # Show first 3
+                self.logger.info(f"     - {lesson.get('error_type', 'unknown')}: {lesson.get('error_pattern', '')[:60]}...")
+        else:
+            self.logger.info(f"  ℹ️  No previous lessons found")
+
+        # Build kwargs for agent
+        kwargs = {
+            'stage_name': stage_name,
+            'autonomy': self.config.autonomy_instructions,
+            'project_root': str(self.project_root),
+            'known_issues': self.knowledge.format_for_prompt(lessons) if lessons else "",
+        }
+
+        if story_id:
+            kwargs['story_id'] = story_id
+            self.logger.info(f"  Creating specific story: {story_id}")
+        else:
+            self.logger.info(f"  Creating next story from epics")
+
+        first_error = None
+        first_error_details = None
+
+        # Retry loop
+        for attempt in range(max_retries + 1):
+            self.logger.info(f"\n  --- Attempt {attempt + 1}/{max_retries + 1} ---")
+            self.logger.info(f"  Spawning {stage_name} agent...")
+            self.logger.info(f"  Timeout: {stage_config.timeout}s")
+
+            start_time = time.time()
+
+            # Spawn agent
+            task = self.spawner.spawn_stage(stage_config, background=True, **kwargs)
+            task_result = self._wait_for_task(task, stage_name)
+
+            elapsed = time.time() - start_time
+
+            # Check success
+            if task_result.success:
+                self.logger.info(f"  ✅ {stage_name} PASSED ({elapsed:.1f}s)")
+
+                # Health check: Verify story file was created
+                self.logger.info(f"  Running post-creation health checks...")
+                health_passed, health_msg = self._verify_story_created(task_result.output, story_id)
+
+                if not health_passed:
+                    self.logger.warn(f"  ⚠️  Health check FAILED: {health_msg}")
+                    self.logger.info(f"  Story file may not have been created correctly")
+
+                    # Capture lesson about health check failure
+                    self.knowledge.add_lesson(
+                        stage=stage_name,
+                        error_type="health_check_failed",
+                        error_pattern=health_msg,
+                        error_message=f"Agent succeeded but health check failed: {health_msg}",
+                        context={"story_id": story_id or "unknown"},
+                        fix={"description": "Verify story file creation and content"},
+                        success=False,
+                        story_id=story_id
+                    )
+
+                    # Treat as failure and retry if available
+                    if attempt < max_retries:
+                        self.logger.info(f"  Retrying due to health check failure...")
+                        first_error = health_msg
+                        first_error_details = task_result.output
+                        continue
+                    else:
+                        self.logger.info(f"  No more retries, returning failure")
+                        return False, task_result.output
+
+                self.logger.info(f"  ✓ Health checks passed")
+
+                # Track prevention if lessons were shown
+                if lessons and attempt == 0:
+                    self.knowledge.track_prevention(stage_name, lesson_ids)
+                    self.logger.info(f"  💡 {len(lessons)} lesson(s) helped prevent errors")
+
+                # Capture lesson if this was a fix after failure
+                if attempt > 0 and first_error:
+                    self.logger.info(f"  Capturing lesson from successful retry...")
+                    lesson_id = self.knowledge.add_lesson(
+                        stage=stage_name,
+                        error_type=classify_error(first_error),
+                        error_pattern=extract_error_pattern(first_error),
+                        error_message=first_error,
+                        context={
+                            "story_id": story_id or "unknown",
+                            "attempts": attempt + 1,
+                            "first_error_details": first_error_details[:500] if first_error_details else None
+                        },
+                        fix={
+                            "description": f"Fixed after {attempt} retries",
+                            "action": "retry_with_fix",
+                            "resolution": task_result.output[:500] if task_result.output else None
+                        },
+                        success=True,
+                        story_id=story_id
+                    )
+                    self.logger.info(f"  💡 Saved lesson: {lesson_id}")
+
+                self.logger.info(f"  {stage_name} completed successfully")
+                return True, task_result.output
+
+            # Agent failed
+            self.logger.error(f"  ❌ {stage_name} FAILED ({elapsed:.1f}s)")
+            self.logger.info(f"  Exit code: {task_result.exit_code}")
+
+            # Log error details
+            if task_result.error:
+                error_preview = task_result.error[:300] if task_result.error else "No error message"
+                self.logger.info(f"  Error: {error_preview}")
+                if len(task_result.error) > 300:
+                    self.logger.info(f"  (Error truncated, full error in log file)")
+
+            # Classify error severity
+            if task_result.error_severity:
+                self.logger.info(f"  Error severity: {task_result.error_severity.value}")
+
+            # Save first error for lesson capture
+            if attempt == 0:
+                first_error = task_result.error or "Unknown error"
+                first_error_details = task_result.output
+
+            # Check if should retry
+            if attempt < max_retries and stage_config.on_failure == "fix_and_retry":
+                self.logger.info(f"  Will retry (attempt {attempt + 2}/{max_retries + 1})...")
+                continue
+            elif attempt >= max_retries:
+                self.logger.info(f"  No more retries available")
+            elif stage_config.on_failure == "abort":
+                self.logger.info(f"  on_failure=abort, will not retry")
+                break
+            elif stage_config.on_failure == "continue":
+                self.logger.info(f"  on_failure=continue, treating as non-critical")
+                break
+
+        # All retries exhausted
+        self.logger.error(f"\n  ❌ {stage_name} FAILED after {max_retries + 1} attempts")
+
+        # Capture lesson about failure
+        if first_error:
+            self.logger.info(f"  Capturing lesson from failure...")
+            lesson_id = self.knowledge.add_lesson(
+                stage=stage_name,
+                error_type=classify_error(first_error),
+                error_pattern=extract_error_pattern(first_error),
+                error_message=first_error,
+                context={
+                    "story_id": story_id or "unknown",
+                    "total_attempts": max_retries + 1,
+                    "error_details": first_error_details[:500] if first_error_details else None
+                },
+                fix={
+                    "description": "Failed after all retries",
+                    "action": "manual_intervention_required"
+                },
+                success=False,
+                story_id=story_id
+            )
+            self.logger.info(f"  💡 Saved failure lesson: {lesson_id}")
+
+        return False, None
+
+    def _run_validate_stage(self, story_id: str, story_file: str) -> Tuple[bool, Optional[str]]:
+        """
+        Run validate stage by spawning agent.
+
+        Enhanced with:
+        - Comprehensive logging at each step
+        - Story file pre-validation (exists, readable, has content)
+        - Validation result parsing (PASS/FAIL detection)
+        - Health check after validation
+        - Detailed error classification
+        - Knowledge base integration
+
+        Args:
+            story_id: Story identifier
+            story_file: Path to story file
+
+        Returns:
+            Tuple of (success, output)
+        """
+        stage_name = "validate"
+        stage_logger = self._get_stage_logger(stage_name, story_id)
+        self.logger.info(f"\n{'='*60}")
+        self.logger.info(f"STAGE: {stage_name}")
+        self.logger.info(f"{'='*60}")
+
+        # Stage config validation
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            self.logger.warn(f"  ⚠️  No config for {stage_name}, skipping")
+            return True, None
+
+        if not stage_config.enabled:
+            self.logger.info(f"  ℹ️  {stage_name} is disabled, skipping")
+            return True, None
+
+        # Pre-validate: Story file must exist and be readable
+        self.logger.info(f"  Pre-validation: Checking story file...")
+        self.logger.info(f"  Story ID: {story_id}")
+        self.logger.info(f"  Story file: {story_file}")
+
+        story_path = Path(story_file)
+        is_valid, error_msg = validate_file_exists(story_path, must_be_file=True, must_be_readable=True)
+
+        if not is_valid:
+            self.logger.error(f"  ❌ Story file validation failed: {error_msg}")
+            # Capture lesson
+            self.knowledge.add_lesson(
+                stage=stage_name,
+                error_type="file_not_found",
+                error_pattern=f"Story file missing: {story_file}",
+                error_message=error_msg,
+                context={"story_id": story_id, "story_file": story_file},
+                fix={"description": "Ensure story file exists before validation"},
+                success=False,
+                story_id=story_id
+            )
+            return False, None
+
+        self.logger.info(f"  ✓ Story file exists and is readable")
+
+        # Check file has minimum content
+        try:
+            content = safe_read(story_path)
+            if len(content.strip()) < 100:
+                self.logger.error(f"  ❌ Story file is too short ({len(content)} chars)")
+                return False, None
+            self.logger.info(f"  ✓ Story file has content ({len(content)} chars)")
+        except Exception as e:
+            self.logger.error(f"  ❌ Error reading story file: {e}")
+            return False, None
+
+        max_retries = stage_config.retry.max if stage_config.retry else 0
+        self.logger.info(f"  Retry policy: max {max_retries} retries, on_failure={stage_config.on_failure}")
+
+        # Get relevant lessons from knowledge base
+        self.logger.info(f"  Querying knowledge base for lessons...")
+        limit = self._get_knowledge_limit(stage_name)
+        lessons = self.knowledge.get_lessons_for_stage(stage_name, limit=limit)
+        lesson_ids = [l["id"] for l in lessons]
+
+        if lessons:
+            self.logger.info(f"  📚 Found {len(lessons)} lesson(s) from previous runs:")
+            for lesson in lessons[:3]:
+                self.logger.info(f"     - {lesson.get('error_type', 'unknown')}: {lesson.get('error_pattern', '')[:60]}...")
+        else:
+            self.logger.info(f"  ℹ️  No previous lessons found")
+
+        # Build kwargs for agent
+        kwargs = {
+            'stage_name': stage_name,
+            'story_id': story_id,
+            'story_file': story_file,
+            'autonomy': self.config.autonomy_instructions,
+            'project_root': str(self.project_root),
+            'known_issues': self.knowledge.format_for_prompt(lessons) if lessons else "",
+        }
+
+        first_error = None
+        first_error_details = None
+
+        # Retry loop
+        for attempt in range(max_retries + 1):
+            self.logger.info(f"\n  --- Attempt {attempt + 1}/{max_retries + 1} ---")
+            self.logger.info(f"  Spawning {stage_name} agent...")
+            self.logger.info(f"  Timeout: {stage_config.timeout}s")
+
+            start_time = time.time()
+
+            # Spawn agent
+            task = self.spawner.spawn_stage(stage_config, background=True, **kwargs)
+            task_result = self._wait_for_task(task, stage_name)
+
+            elapsed = time.time() - start_time
+
+            # Check success
+            if task_result.success:
+                self.logger.info(f"  ✅ {stage_name} agent completed ({elapsed:.1f}s)")
+
+                # Parse validation result from output
+                self.logger.info(f"  Parsing validation results...")
+                is_valid, validation_msg = self._parse_validation_result(task_result.output)
+
+                if not is_valid:
+                    self.logger.error(f"  ❌ Validation FAILED: {validation_msg}")
+                    self.logger.info(f"  Story has validation issues that must be fixed")
+
+                    # Capture lesson about validation failure
+                    self.knowledge.add_lesson(
+                        stage=stage_name,
+                        error_type="validation_failed",
+                        error_pattern=validation_msg,
+                        error_message=f"Story validation failed: {validation_msg}",
+                        context={"story_id": story_id, "story_file": story_file},
+                        fix={"description": "Fix validation issues in story file"},
+                        success=False,
+                        story_id=story_id
+                    )
+
+                    # Treat as failure and retry if available
+                    if attempt < max_retries and stage_config.on_failure == "fix_and_retry":
+                        self.logger.info(f"  Retrying validation...")
+                        first_error = validation_msg
+                        first_error_details = task_result.output
+                        continue
+                    else:
+                        self.logger.error(f"  No more retries, validation failed")
+                        return False, task_result.output
+
+                self.logger.info(f"  ✅ Validation PASSED: {validation_msg}")
+
+                # Health check: Verify story still has all required sections
+                self.logger.info(f"  Running post-validation health checks...")
+                health_passed, health_msg = self._verify_story_valid(story_file)
+
+                if not health_passed:
+                    self.logger.warn(f"  ⚠️  Health check FAILED: {health_msg}")
+                    # Non-critical, just warn
+                    self.logger.warn(f"  Warning: Story may have issues but validation passed")
+
+                self.logger.info(f"  ✓ Health checks passed")
+
+                # Track prevention if lessons were shown
+                if lessons and attempt == 0:
+                    self.knowledge.track_prevention(stage_name, lesson_ids)
+                    self.logger.info(f"  💡 {len(lessons)} lesson(s) helped prevent errors")
+
+                # Capture lesson if this was a fix after failure
+                if attempt > 0 and first_error:
+                    self.logger.info(f"  Capturing lesson from successful retry...")
+                    lesson_id = self.knowledge.add_lesson(
+                        stage=stage_name,
+                        error_type=classify_error(first_error),
+                        error_pattern=extract_error_pattern(first_error),
+                        error_message=first_error,
+                        context={
+                            "story_id": story_id,
+                            "story_file": story_file,
+                            "attempts": attempt + 1,
+                            "first_error_details": first_error_details[:500] if first_error_details else None
+                        },
+                        fix={
+                            "description": f"Fixed validation issues after {attempt} retries",
+                            "action": "retry_with_fix",
+                            "resolution": task_result.output[:500] if task_result.output else None
+                        },
+                        success=True,
+                        story_id=story_id
+                    )
+                    self.logger.info(f"  💡 Saved lesson: {lesson_id}")
+
+                self.logger.info(f"  {stage_name} completed successfully")
+                return True, task_result.output
+
+            # Agent failed
+            self.logger.error(f"  ❌ {stage_name} agent FAILED ({elapsed:.1f}s)")
+            self.logger.info(f"  Exit code: {task_result.exit_code}")
+
+            # Log error details
+            if task_result.error:
+                error_preview = task_result.error[:300] if task_result.error else "No error message"
+                self.logger.info(f"  Error: {error_preview}")
+                if len(task_result.error) > 300:
+                    self.logger.info(f"  (Error truncated, full error in log file)")
+
+            # Classify error severity
+            if task_result.error_severity:
+                self.logger.info(f"  Error severity: {task_result.error_severity.value}")
+
+            # Save first error
+            if attempt == 0:
+                first_error = task_result.error or "Unknown error"
+                first_error_details = task_result.output
+
+            # Check if should retry
+            if attempt < max_retries and stage_config.on_failure == "fix_and_retry":
+                self.logger.info(f"  Will retry (attempt {attempt + 2}/{max_retries + 1})...")
+                continue
+            elif attempt >= max_retries:
+                self.logger.info(f"  No more retries available")
+            elif stage_config.on_failure == "abort":
+                self.logger.info(f"  on_failure=abort, will not retry")
+                break
+            elif stage_config.on_failure == "continue":
+                self.logger.info(f"  on_failure=continue, treating as non-critical")
+                break
+
+        # All retries exhausted
+        self.logger.error(f"\n  ❌ {stage_name} FAILED after {max_retries + 1} attempts")
+
+        # Capture lesson about failure
+        if first_error:
+            self.logger.info(f"  Capturing lesson from failure...")
+            lesson_id = self.knowledge.add_lesson(
+                stage=stage_name,
+                error_type=classify_error(first_error),
+                error_pattern=extract_error_pattern(first_error),
+                error_message=first_error,
+                context={
+                    "story_id": story_id,
+                    "story_file": story_file,
+                    "total_attempts": max_retries + 1,
+                    "error_details": first_error_details[:500] if first_error_details else None
+                },
+                fix={
+                    "description": "Failed after all retries",
+                    "action": "manual_intervention_required"
+                },
+                success=False,
+                story_id=story_id
+            )
+            self.logger.info(f"  💡 Saved failure lesson: {lesson_id}")
+
+        return False, None
+
+    def _parse_validation_result(self, agent_output: Optional[str]) -> Tuple[bool, str]:
+        """
+        Parse validation result from agent output.
+
+        Looks for patterns like:
+        - "PASS" / "PASSED" / "✅"
+        - "FAIL" / "FAILED" / "❌"
+        - "Validation passed"
+        - "Validation failed: <reason>"
+
+        Args:
+            agent_output: Output from validate agent
+
+        Returns:
+            Tuple of (is_valid, message)
+        """
+        if not agent_output:
+            return False, "No output from validation agent"
+
+        output_lower = agent_output.lower()
+
+        # Look for explicit PASS
+        pass_patterns = [
+            r'\bpass\b',
+            r'\bpassed\b',
+            r'validation\s+(?:is\s+)?(?:successful|passed|pass)',
+            r'story\s+is\s+ready',
+            r'✅',
+            r'✓',
+        ]
+
+        # Look for explicit FAIL
+        fail_patterns = [
+            r'\bfail\b',
+            r'\bfailed\b',
+            r'validation\s+(?:is\s+)?(?:failed|fail)',
+            r'not\s+ready',
+            r'❌',
+            r'✗',
+        ]
+
+        import re
+
+        has_pass = any(re.search(pattern, output_lower) for pattern in pass_patterns)
+        has_fail = any(re.search(pattern, output_lower) for pattern in fail_patterns)
+
+        # Extract failure reasons if present
+        fail_reason_match = re.search(
+            r'(?:fail|failed|issue|problem|missing)[:;\-\s]+(.{0,200})',
+            output_lower,
+            re.IGNORECASE
+        )
+
+        if has_fail:
+            if fail_reason_match:
+                reason = fail_reason_match.group(1).strip()
+                return False, f"Validation failed: {reason[:100]}"
+            else:
+                return False, "Validation failed (no specific reason given)"
+
+        if has_pass:
+            return True, "Story is ready for development"
+
+        # No clear PASS/FAIL found
+        # Check for specific validation issues
+        issues = []
+        if "missing" in output_lower:
+            issues.append("missing required content")
+        if "unclear" in output_lower or "not clear" in output_lower:
+            issues.append("unclear requirements")
+        if "no tasks" in output_lower or "tasks not defined" in output_lower:
+            issues.append("tasks not properly defined")
+        if "no acceptance criteria" in output_lower:
+            issues.append("acceptance criteria missing")
+
+        if issues:
+            return False, f"Validation issues: {', '.join(issues)}"
+
+        # Default to PASS if no clear failure indicators
+        self.logger.warn(f"  ⚠️  No clear PASS/FAIL in output, defaulting to PASS")
+        return True, "Validation completed (no explicit result)"
+
+    def _verify_story_valid(self, story_file: str) -> Tuple[bool, str]:
+        """
+        Verify story file has all required sections for development.
+
+        Health checks:
+        1. File still exists and is readable
+        2. Has required sections (Story, Tasks, Acceptance Criteria)
+        3. Has at least one task defined
+        4. Has at least one acceptance criterion
+
+        Args:
+            story_file: Path to story file
+
+        Returns:
+            Tuple of (is_healthy, message)
+        """
+        self.logger.info(f"  Health Check: Verifying story readiness...")
+
+        story_path = Path(story_file)
+
+        # Check file exists
+        is_valid, error_msg = validate_file_exists(story_path, must_be_file=True, must_be_readable=True)
+        if not is_valid:
+            return False, f"Story file validation failed: {error_msg}"
+
+        try:
+            content = safe_read(story_path)
+
+            # Check required sections
+            missing_sections = []
+
+            # Check for Story title
+            if "# Story" not in content:
+                missing_sections.append("Story title/description")
+
+            # Check for Acceptance Criteria
+            if "## Acceptance Criteria" not in content:
+                missing_sections.append("Acceptance criteria section")
+
+            # Check for Tasks section (accept multiple variations)
+            tasks_patterns = [
+                "## Implementation Tasks",
+                "## Tasks / Subtasks",
+                "## Tasks/Subtasks",
+                "## Tasks",
+            ]
+            has_tasks_section = any(pattern in content for pattern in tasks_patterns)
+            if not has_tasks_section:
+                missing_sections.append("Tasks section")
+
+            if missing_sections:
+                return False, f"Missing sections: {', '.join(missing_sections)}"
+
+            # Check has at least one task
+            task_patterns = [
+                r'###\s+Task\s+\d+:',  # BMAD format: ### Task 1:
+                r'-\s+\[\s*\]',        # Flat format: - [ ] task
+            ]
+
+            has_tasks = any(re.search(pattern, content) for pattern in task_patterns)
+            if not has_tasks:
+                return False, "No tasks defined in story"
+
+            # Check has at least one acceptance criterion
+            ac_match = re.search(r'## Acceptance Criteria\s*\n(.{50,})', content, re.IGNORECASE | re.DOTALL)
+            if not ac_match or len(ac_match.group(1).strip()) < 20:
+                return False, "No meaningful acceptance criteria defined"
+
+            self.logger.info(f"  ✓ Story file validated")
+            self.logger.info(f"  ✓ All required sections present")
+            self.logger.info(f"  ✓ Has tasks and acceptance criteria")
+
+            return True, "Story is ready for development"
+
+        except Exception as e:
+            return False, f"Error validating story: {e}"
+
+    def _verify_story_created(self, agent_output: Optional[str], expected_story_id: Optional[str] = None) -> Tuple[bool, str]:
+        """
+        Verify that the story file was created correctly.
+
+        Health checks:
+        1. Story file exists at expected location
+        2. Story file is readable
+        3. Story file contains required sections
+
+        Args:
+            agent_output: Output from the create-story agent
+            expected_story_id: Expected story_id (if known)
+
+        Returns:
+            Tuple of (is_healthy, message)
+        """
+        self.logger.info(f"  Health Check: Verifying story creation...")
+
+        if not agent_output:
+            return False, "No output from agent"
+
+        # Extract story_id from output (use expected_story_id as fallback hint)
+        extracted_id = self._extract_story_id_from_output(agent_output, hint_story_id=expected_story_id)
+
+        if not extracted_id:
+            return False, "Could not extract story_id from agent output"
+
+        # If expected_story_id provided, verify it matches (unless we used it as fallback)
+        if expected_story_id and extracted_id != expected_story_id:
+            # Only warn if they don't match, don't fail (hint might have fixed it)
+            self.logger.warn(f"  ⚠️  Story ID mismatch: expected {expected_story_id}, got {extracted_id}")
+            self.logger.info(f"  Using extracted ID: {extracted_id}")
+
+        # Find story file
+        story_file = self.config_loader.find_story_file(extracted_id, self.config)
+
+        if not story_file:
+            return False, f"Story file not found for {extracted_id}"
+
+        # Validate file exists and is readable
+        is_valid, error_msg = validate_file_exists(story_file, must_be_file=True, must_be_readable=True)
+
+        if not is_valid:
+            return False, f"Story file validation failed: {error_msg}"
+
+        # Check file content has minimum required sections
+        try:
+            content = safe_read(story_file)
+
+            # Check for Story title
+            if "# Story" not in content:
+                return False, "Story file missing sections: Story title"
+
+            # Check for Acceptance Criteria
+            if "## Acceptance Criteria" not in content:
+                return False, "Story file missing sections: Acceptance Criteria"
+
+            # Check for Tasks section (accept multiple variations)
+            tasks_patterns = [
+                "## Implementation Tasks",
+                "## Tasks / Subtasks",
+                "## Tasks/Subtasks",
+                "## Tasks",
+            ]
+            has_tasks_section = any(pattern in content for pattern in tasks_patterns)
+            if not has_tasks_section:
+                return False, "Story file missing sections: Tasks section (## Tasks, ## Implementation Tasks, or ## Tasks / Subtasks)"
+
+            # Check file is not empty
+            if len(content.strip()) < 100:
+                return False, "Story file is too short (< 100 chars)"
+
+            self.logger.info(f"  ✓ Story file verified: {story_file.name}")
+            self.logger.info(f"  ✓ File size: {len(content)} chars")
+            self.logger.info(f"  ✓ All required sections present")
+
+            return True, "Story file created and validated successfully"
+
+        except Exception as e:
+            return False, f"Error reading story file: {e}"
+
+    def _is_disabled(self, stage_name: str) -> bool:
+        """Check if a stage is disabled in config."""
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            return False
+        return not stage_config.enabled
+
+    def _run_stage(self, stage_name: str, **kwargs) -> bool:
+        """
+        Run a stage, auto-detecting execution type from config.
+
+        Routes to appropriate execution method based on 'execution' field.
+        """
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            log(f"  No config for stage {stage_name}, skipping")
+            return True
+
+        if not stage_config.enabled:
+            log(f"  Stage {stage_name} is disabled, skipping")
+            return True
+
+        execution_type = stage_config.execution
+        log(f"  Execution type: {execution_type}")
+
+        if execution_type == "spawn":
+            return self._run_spawn_stage(stage_name, **kwargs)
+        elif execution_type == "direct":
+            return self._run_command_stage(stage_name)
+        else:
+            log(f"  Unknown execution type: {execution_type}, defaulting to spawn")
+            return self._run_spawn_stage(stage_name, **kwargs)
+
+    def _run_spawn_stage(self, stage_name: str, **kwargs) -> bool:
+        """
+        Run a stage by spawning an agent.
+
+        IMPORTANT: All work is done by the spawned agent.
+        The orchestrator only waits for completion.
+
+        Integrates knowledge base to inject lessons and capture fixes.
+        """
+        # Create stage logger
+        story_id = kwargs.get('story_id', self.story_id)
+        stage_logger = self._get_stage_logger(stage_name, story_id)
+
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            self.logger.info(f"  No config for stage {stage_name}, skipping")
+            return True
+
+        max_retries = stage_config.retry.max if stage_config.retry else 0
+
+        # Get relevant lessons for this stage
+        limit = self._get_knowledge_limit(stage_name)
+        lessons = self.knowledge.get_lessons_for_stage(stage_name, limit=limit)
+        lesson_ids = [l["id"] for l in lessons]
+
+        if lessons:
+            self.logger.info(f"  📚 Applying {len(lessons)} lesson(s) from previous runs")
+            kwargs['known_issues'] = self.knowledge.format_for_prompt(lessons)
+        else:
+            kwargs['known_issues'] = ""
+
+        first_error = None
+
+        for attempt in range(max_retries + 1):
+            self.logger.info(f"  Spawning {stage_name} agent (attempt {attempt + 1}/{max_retries + 1})...")
+
+            # Add stage_name to kwargs for logging
+            kwargs['stage_name'] = stage_name
+
+            # Add autonomy instructions and project_root if not already present
+            if 'autonomy' not in kwargs:
+                kwargs['autonomy'] = self.config.autonomy_instructions
+            if 'project_root' not in kwargs:
+                kwargs['project_root'] = str(self.project_root)
+
+            task = self.spawner.spawn_stage(stage_config, background=True, **kwargs)
+            task_result = self._wait_for_task(task, stage_name)
+
+            if task_result.success:
+                self.logger.info(f"  {stage_name} PASSED ({task_result.duration_seconds:.1f}s)")
+
+                # Track prevention if lessons were shown
+                if lessons and attempt == 0:
+                    self.knowledge.track_prevention(stage_name, lesson_ids)
+                    self.logger.info(f"  💡 {len(lessons)} lesson(s) helped prevent errors")
+
+                # Capture lesson if this was a fix after failure
+                if attempt > 0 and first_error:
+                    lesson_id = self.knowledge.add_lesson(
+                        stage=stage_name,
+                        error_type=classify_error(first_error),
+                        error_pattern=extract_error_pattern(first_error),
+                        error_message=first_error,
+                        context={
+                            "file": kwargs.get("story_file", "unknown"),
+                            "story_id": kwargs.get("story_id", "unknown")
+                        },
+                        fix={
+                            "description": f"Fix applied after {attempt} retries",
+                            "action": "retry_with_fix"
+                        },
+                        success=True,
+                        story_id=kwargs.get("story_id")
+                    )
+                    self.logger.info(f"  💡 Saved lesson: {lesson_id}")
+
+                return True
+
+            self.logger.info(f"  {stage_name} FAILED")
+
+            # Save first error for lesson capture
+            if attempt == 0:
+                first_error = task_result.error
+
+            # Retry if available
+            if attempt < max_retries and stage_config.on_failure == "fix_and_retry":
+                self.logger.error(f"  Attempt {attempt + 1} failed, will retry...")
+                continue
+
+        # All retries exhausted
+        if stage_config.on_failure == "continue":
+            self.logger.error(f"  {stage_name} failed but continuing (on_failure=continue)")
+            return False
+
+        self.logger.error(f"  {stage_name} failed after {max_retries + 1} attempts")
+        return False
+
+    def _run_command_stage(self, stage_name: str) -> bool:
+        """
+        Run a bash command stage (typecheck, unit-test).
+
+        IMPORTANT: The orchestrator ONLY runs the check command.
+        If the check fails, it spawns an agent to fix.
+        The orchestrator NEVER fixes issues itself.
+        """
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            self.logger.info(f"  No config for stage {stage_name}, skipping")
+            return True
+
+        command = stage_config.command
+        if not command:
+            self.logger.info(f"  No command for stage {stage_name}, skipping")
+            return True
+
+        max_retries = stage_config.retry.max if stage_config.retry else 0
+        timeout = stage_config.timeout or 120
+
+        # Get relevant lessons
+        limit = self._get_knowledge_limit(stage_name)
+        lessons = self.knowledge.get_lessons_for_stage(stage_name, limit=limit)
+        lesson_ids = [l["id"] for l in lessons]
+
+        if lessons:
+            self.logger.info(f"  📚 {len(lessons)} lesson(s) available for {stage_name}")
+
+        first_error = None
+
+        for attempt in range(max_retries + 1):
+            self.logger.info(f"  Running: {command} (attempt {attempt + 1}/{max_retries + 1})...")
+
+            try:
+                proc = subprocess.run(
+                    command,
+                    shell=True,
+                    cwd=str(self.project_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout
+                )
+
+                if proc.returncode == 0:
+                    self.logger.info(f"  {stage_name} PASSED")
+
+                    # Track prevention
+                    if lessons and attempt == 0:
+                        self.knowledge.track_prevention(stage_name, lesson_ids)
+                        self.logger.info(f"  💡 {len(lessons)} lesson(s) helped prevent errors")
+
+                    # Capture lesson if fixed
+                    if attempt > 0 and first_error:
+                        lesson_id = self.knowledge.add_lesson(
+                            stage=stage_name,
+                            error_type=classify_error(first_error),
+                            error_pattern=extract_error_pattern(first_error),
+                            error_message=first_error,
+                            context={"command": command},
+                            fix={
+                                "description": f"Fix applied after {attempt} retries",
+                                "action": "fix_agent_applied"
+                            },
+                            success=True,
+                            story_id=None
+                        )
+                        self.logger.info(f"  💡 Saved lesson: {lesson_id}")
+
+                    return True
+
+                # Command failed
+                errors = (proc.stdout + proc.stderr).strip()
+                self.logger.info(f"  {stage_name} FAILED (exit code {proc.returncode})")
+
+                if attempt == 0:
+                    first_error = errors
+
+                # Spawn fix agent if retries available
+                if attempt < max_retries and stage_config.on_failure == "fix_and_retry":
+                    self.logger.info(f"  Spawning fix agent for {stage_name}...")
+                    self.logger.info(f"  Error preview: {errors[:300]}...")
+
+                    fix_kwargs = {
+                        "errors": errors,
+                        "stage_name": f"{stage_name}-fix",
+                        "autonomy": self.config.autonomy_instructions,
+                        "project_root": str(self.project_root)
+                    }
+                    if lessons:
+                        fix_kwargs['known_issues'] = self.knowledge.format_for_prompt(lessons)
+                    else:
+                        fix_kwargs['known_issues'] = ""
+
+                    fix_task = self.spawner.spawn_stage(
+                        stage_config,
+                        background=True,
+                        **fix_kwargs
+                    )
+                    fix_result = self._wait_for_task(fix_task, f"{stage_name}-fix")
+
+                    if fix_result.success:
+                        self.logger.info(f"  Fix agent completed, will retry {stage_name}...")
+                    else:
+                        self.logger.error(f"  Fix agent failed: {fix_result.error[:200] if fix_result.error else 'unknown'}...")
+
+                    continue
+
+            except subprocess.TimeoutExpired:
+                self.logger.info(f"  {stage_name} timed out after {timeout}s")
+
+        # All retries exhausted
+        if stage_config.on_failure == "continue":
+            self.logger.error(f"  {stage_name} failed but continuing (on_failure=continue)")
+            return False
+
+        self.logger.error(f"  {stage_name} failed after {max_retries + 1} attempts")
+        return False
+
+    def _story_requires_tests(self, story_id: str, story_file: str) -> Tuple[bool, str]:
+        """
+        Determine if a story requires test cases based on story type.
+
+        Checks story file for type metadata or infers from story_id.
+
+        Args:
+            story_id: Story identifier
+            story_file: Path to story file
+
+        Returns:
+            Tuple of (requires_tests, reason)
+        """
+        try:
+            # Get story type configuration
+            story_types_config = getattr(self.config, 'story_types', None)
+            if not story_types_config:
+                # Default: all stories require tests
+                return True, "No story type config, defaulting to require tests"
+
+            skip_types = getattr(story_types_config, 'skip_tests', [])
+            require_types = getattr(story_types_config, 'require_tests', [])
+
+            # Try to read story file for type metadata
+            story_path = Path(story_file)
+            if story_path.exists():
+                content = safe_read(story_path)
+                if content:
+                    # Look for type metadata in story file
+                    # Pattern: "Type: feature" or "Story Type: documentation"
+                    import re
+                    type_match = re.search(r'(?:Story\s+)?Type:\s*(\w+(?:-\w+)*)', content, re.IGNORECASE)
+                    if type_match:
+                        story_type = type_match.group(1).lower()
+
+                        if story_type in skip_types:
+                            return False, f"Story type '{story_type}' skips tests"
+                        elif story_type in require_types:
+                            return True, f"Story type '{story_type}' requires tests"
+
+            # Fallback: infer from story_id patterns
+            story_id_lower = story_id.lower()
+
+            # Check if story_id contains skip_test keywords
+            for skip_type in skip_types:
+                if skip_type.replace('-', '') in story_id_lower.replace('-', ''):
+                    return False, f"Story ID contains '{skip_type}' keyword, skipping tests"
+
+            # Default: require tests if not explicitly in skip list
+            return True, "Story requires tests (default behavior)"
+
+        except Exception as e:
+            self.logger.warn(f"  ⚠ Error checking story type: {e}, defaulting to require tests")
+            return True, f"Error checking type: {e}"
+
+    def _verify_tdm_created(self, story_id: str) -> Tuple[bool, str]:
+        """
+        Verify Test Design Matrix (TDM) file was created after test-case-generation.
+
+        Checks:
+        - TDM file exists at expected location
+        - File is readable and has content
+        - File contains expected test case structure
+
+        Args:
+            story_id: Story identifier
+
+        Returns:
+            Tuple of (health_passed, message)
+        """
+        try:
+            # Expected TDM file location
+            tdm_locations = [
+                self.project_root / f"docs/test-artifacts/{story_id}/design/tdm.yaml",
+                self.project_root / f"docs/test-artifacts/{story_id}/tdm.yaml",
+                self.project_root / f"test-artifacts/{story_id}/design/tdm.yaml",
+            ]
+
+            tdm_file = None
+            for location in tdm_locations:
+                if location.exists():
+                    tdm_file = location
+                    break
+
+            if not tdm_file:
+                return False, f"TDM file not found at expected locations"
+
+            # Check file is readable
+            content = safe_read(tdm_file)
+            if not content:
+                return False, "TDM file is empty"
+
+            # Check minimum content length
+            if len(content.strip()) < 50:
+                return False, "TDM file content is too short"
+
+            # Check for expected YAML structure
+            import yaml
+            try:
+                tdm_data = yaml.safe_load(content)
+                if not tdm_data:
+                    return False, "TDM file has no valid YAML data"
+
+                # Check for test cases or test suites
+                has_test_data = (
+                    'test_cases' in tdm_data or
+                    'smoke_p0' in tdm_data or
+                    'critical_sqa_p1' in tdm_data or
+                    'test_suites' in tdm_data
+                )
+
+                if not has_test_data:
+                    self.logger.warn(f"  ⚠ Warning: TDM file missing expected test case structure")
+
+            except yaml.YAMLError as e:
+                self.logger.warn(f"  ⚠ Warning: TDM file is not valid YAML: {e}")
+
+            return True, f"TDM file created at {tdm_file.relative_to(self.project_root)}"
+
+        except Exception as e:
+            return False, f"Health check failed: {e}"
+
+    def _pre_validate_test_case_generation(self, story_id: str, story_file: str) -> Tuple[bool, str]:
+        """
+        Validate prerequisites before generating test cases.
+
+        Checks:
+        - Story file exists and is readable
+        - Story has acceptance criteria (for test case derivation)
+        - Story requires tests (based on type)
+
+        Args:
+            story_id: Story identifier
+            story_file: Path to story file
+
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        try:
+            # Check 1: Story file exists and is readable
+            is_valid, error_msg = validate_file_exists(
+                story_file,
+                must_be_file=True,
+                must_be_readable=True
+            )
+            if not is_valid:
+                return False, f"Story file validation failed: {error_msg}"
+
+            # Check 2: File has content
+            story_path = Path(story_file)
+            content = safe_read(story_path)
+            if not content or len(content.strip()) < 100:
+                return False, "Story file is empty or too short"
+
+            # Check 3: Has acceptance criteria section (important for test derivation)
+            if "## Acceptance Criteria" not in content and "## Success Criteria" not in content:
+                self.logger.warn(f"  ⚠ Warning: Story file missing Acceptance Criteria section")
+                self.logger.info(f"  Test cases will be derived from task descriptions")
+
+            # Check 4: Story requires tests
+            requires_tests, reason = self._story_requires_tests(story_id, story_file)
+            if not requires_tests:
+                return False, f"Story does not require tests: {reason}"
+
+            self.logger.info(f"  Pre-validation: {reason}")
+            return True, f"Story validated for test case generation"
+
+        except Exception as e:
+            return False, f"Pre-validation error: {e}"
+
+    def _verify_task_completed(self, story_file: str, task_index: int) -> Tuple[bool, str]:
+        """
+        Verify a task was completed properly after agent execution.
+
+        Checks:
+        - Story file still exists and is readable
+        - Task is marked as complete [x] in story file
+        - File list was updated with changes
+        - Change log was updated
+
+        Args:
+            story_file: Path to story file
+            task_index: Index of the task that should be complete
+
+        Returns:
+            Tuple of (health_passed, message)
+        """
+        try:
+            # Check 1: Story file exists and is readable
+            story_path = Path(story_file)
+            if not story_path.exists():
+                return False, f"Story file not found: {story_file}"
+
+            content = safe_read(story_path)
+            if not content:
+                return False, f"Story file is empty"
+
+            # Check 2: Parse tasks and verify this task is marked complete
+            tasks = parse_story_tasks(story_path)
+            if not tasks:
+                return False, "No tasks found in story file after task completion"
+
+            # Find the task we just completed
+            completed_task = None
+            for task in tasks:
+                if task.index == task_index:
+                    completed_task = task
+                    break
+
+            if not completed_task:
+                return False, f"Task {task_index} not found in story file"
+
+            if not completed_task.is_complete:
+                return False, f"Task {task_index} is not marked as complete [x]"
+
+            # Check 3: Verify File List section exists (agent should update it)
+            if "## File List" not in content and "## Files Changed" not in content:
+                self.logger.warn(f"  ⚠ Warning: No File List section found in story file")
+
+            # Check 4: Verify Change Log section exists (agent should update it)
+            if "## Change Log" not in content and "## Changes" not in content:
+                self.logger.warn(f"  ⚠ Warning: No Change Log section found in story file")
+
+            return True, f"Task {task_index} verified complete"
+
+        except Exception as e:
+            return False, f"Health check failed: {e}"
+
+    def _pre_validate_development(self, story_file: str) -> Tuple[bool, str]:
+        """
+        Validate story file before starting development.
+
+        Checks:
+        - Story file exists and is readable
+        - Has implementation tasks section
+        - Has at least one task defined
+        - Story is in ready-for-dev status (optional check)
+
+        Args:
+            story_file: Path to story file
+
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        try:
+            # Check 1: File exists and is readable
+            is_valid, error_msg = validate_file_exists(
+                story_file,
+                must_be_file=True,
+                must_be_readable=True
+            )
+            if not is_valid:
+                return False, f"Story file validation failed: {error_msg}"
+
+            # Check 2: File has content
+            story_path = Path(story_file)
+            content = safe_read(story_path)
+            if not content or len(content.strip()) < 100:
+                return False, "Story file is empty or too short"
+
+            # Check 3: Has tasks section (accept multiple variations)
+            tasks_patterns = [
+                "## Implementation Tasks",
+                "## Tasks / Subtasks",
+                "## Tasks/Subtasks",
+                "## Tasks",
+            ]
+            has_tasks_section = any(pattern in content for pattern in tasks_patterns)
+            if not has_tasks_section:
+                return False, "Story file missing Tasks section (## Tasks, ## Implementation Tasks, or ## Tasks / Subtasks)"
+
+            # Check 4: Can parse tasks
+            tasks = parse_story_tasks(story_path)
+            if not tasks:
+                return False, "No tasks found in story file"
+
+            self.logger.info(f"  Pre-validation: Story has {len(tasks)} task(s)")
+            incomplete = get_incomplete_tasks(tasks)
+            self.logger.info(f"  Pre-validation: {len(incomplete)} task(s) need implementation")
+
+            return True, f"Story validated: {len(tasks)} tasks, {len(incomplete)} incomplete"
+
+        except Exception as e:
+            return False, f"Pre-validation error: {e}"
+
+    def _run_develop_with_decomposition(self, story_id: str, story_file: str) -> bool:
+        """
+        Run development stage with task decomposition.
+
+        Enhanced with:
+        - Comprehensive logging at each step
+        - Pre-development validation of story file
+        - Post-task health checks to verify completion
+        - Detailed error classification and handling
+        - Knowledge base integration for each task
+
+        Spawns 1 agent per task instead of 1 agent for entire story.
+
+        Returns:
+            True if all tasks completed successfully, False otherwise
+        """
+        stage_name = "develop"
+        stage_logger = self._get_stage_logger(stage_name, story_id)
+        stage_logger.info(f"\n{'='*60}")
+        stage_logger.info(f"  STAGE: Develop (Task Decomposition)")
+        stage_logger.info(f"{'='*60}")
+        stage_logger.info(f"  Story: {story_id}")
+        stage_logger.info(f"  File: {story_file}")
+        stage_logger.info(f"  Mode: 1 agent per task")
+        stage_logger.info(f"")
+
+        # Pre-development validation
+        stage_logger.info(f"  [Pre-Development Validation]")
+        is_valid, validation_msg = self._pre_validate_development(story_file)
+        if not is_valid:
+            stage_logger.error(f"  ❌ Pre-validation failed: {validation_msg}")
+            stage_logger.info(f"")
+            # Capture lesson
+            self.knowledge.add_lesson(
+                stage=stage_name,
+                error_type="pre_validation_failed",
+                error_pattern=validation_msg,
+                error_message=validation_msg,
+                context={"story_id": story_id or "unknown", "story_file": story_file},
+                fix={"description": "Ensure story file exists and has valid tasks before development"},
+                success=False,
+                story_id=story_id
+            )
+            return False
+
+        stage_logger.info(f"  ✅ Pre-validation passed: {validation_msg}")
+        stage_logger.info(f"")
+
+        try:
+            # Step 1: Parse tasks from story file
+            stage_logger.info(f"  [Task Parsing]")
+            tasks = parse_story_tasks(Path(story_file))
+
+            if not tasks:
+                stage_logger.warn("  ⚠ No tasks found in story file")
+                stage_logger.info(f"")
+                return True
+
+            stage_logger.info(f"  ✅ Found {len(tasks)} task(s) in story")
+            stage_logger.info(f"  Summary: {format_tasks_summary(tasks)}")
+            stage_logger.info(f"")
+
+            # Step 2: Check if decomposition needed
+            if not should_decompose(tasks):
+                stage_logger.info("  ✅ All tasks already complete, skipping development")
+                stage_logger.info(f"")
+                return True
+
+            # Step 3: Get incomplete tasks
+            incomplete_tasks = get_incomplete_tasks(tasks)
+            stage_logger.info(f"  [Task Execution Plan]")
+            stage_logger.info(f"  Total tasks: {len(tasks)}")
+            stage_logger.info(f"  Incomplete: {len(incomplete_tasks)}")
+            stage_logger.info(f"  Strategy: Spawn 1 agent per task")
+            stage_logger.info(f"")
+
+            # Step 4: Execute each task with separate agent
+            stage_config = self.config.stages.get("develop")
+            task_timeout = getattr(stage_config, 'task_timeout', 3600) if stage_config else 3600
+
+            for i, task in enumerate(incomplete_tasks, 1):
+                task_title = task.content.split('\n')[0][:60]
+                stage_logger.info(f"{'─'*60}")
+                stage_logger.info(f"  Task {task.index}/{len(tasks)}: {task_title}...")
+                stage_logger.info(f"{'─'*60}")
+
+                # Get knowledge for this specific task
+                limit = self._get_knowledge_limit(stage_name)
+                lessons = self.knowledge.get_lessons_for_stage(stage_name, limit=limit)
+                lesson_ids = [l["id"] for l in lessons]
+
+                if lessons:
+                    stage_logger.info(f"  📚 Applying {len(lessons)} lesson(s) from knowledge base")
+                stage_logger.info(f"")
+
+                # Format task-specific prompt
+                task_kwargs = {
+                    'story_id': story_id,
+                    'story_file': story_file,
+                    'task_index': task.index,
+                    'task_content': task.content,
+                    'autonomy': self.config.autonomy_instructions,
+                    'known_issues': self.knowledge.format_for_prompt(lessons) if lessons else "",
+                    'project_root': str(self.project_root),
+                    'stage_name': f"develop-task-{task.index}",
+                }
+
+                # Retry logic for this task
+                max_retries = stage_config.retry.max if stage_config and stage_config.retry else 3
+                task_passed = False
+                task_health_passed = False
+
+                for attempt in range(max_retries + 1):
+                    if attempt > 0:
+                        stage_logger.info(f"  🔄 Retry {attempt}/{max_retries} for task {task.index}")
+                        stage_logger.info(f"")
+
+                    # Spawn agent for THIS TASK ONLY
+                    stage_logger.info(f"  🚀 Spawning agent for task {task.index}...")
+                    stage_logger.info(f"  Timeout: {task_timeout}s")
+
+                    task_bg = self.spawner.spawn_stage(
+                        stage_config,
+                        background=True,
+                        use_task_prompt=True,  # Signal to use task_prompt instead of story_prompt
+                        **task_kwargs
+                    )
+
+                    # Wait for task completion
+                    task_result = self._wait_for_task(task_bg, f"Task {task.index}")
+
+                    if task_result.success:
+                        stage_logger.info(f"  ✅ Agent completed (duration: {task_result.duration_seconds:.1f}s)")
+
+                        # Health check: Verify task was actually completed
+                        stage_logger.info(f"  [Post-Task Health Check]")
+                        health_passed, health_msg = self._verify_task_completed(story_file, task.index)
+
+                        if not health_passed:
+                            stage_logger.error(f"  ❌ Health check failed: {health_msg}")
+                            stage_logger.info(f"")
+
+                            # Capture lesson on health check failure
+                            if attempt == max_retries:
+                                self.knowledge.add_lesson(
+                                    stage=stage_name,
+                                    error_type="task_health_check_failed",
+                                    error_pattern=health_msg,
+                                    error_message=health_msg,
+                                    context={"story_id": story_id, "task_index": task.index, "attempts": max_retries + 1},
+                                    fix={"description": f"Agent completed but task {task.index} not properly marked complete"},
+                                    success=False,
+                                    story_id=story_id
+                                )
+
+                            # Retry if we have attempts left
+                            if attempt < max_retries:
+                                continue
+                            else:
+                                stage_logger.error(f"  ❌ Task {task.index} failed health check after {max_retries + 1} attempts")
+                                break
+                        else:
+                            stage_logger.info(f"  ✅ Health check passed: {health_msg}")
+
+                            # Track prevention if lessons were shown
+                            if lessons and attempt == 0:
+                                self.knowledge.track_prevention(stage_name, lesson_ids)
+                                stage_logger.info(f"  💡 {len(lessons)} lesson(s) helped prevent errors")
+
+                            task_passed = True
+                            task_health_passed = True
+                            stage_logger.info(f"")
+                            break
+
+                    else:
+                        stage_logger.error(f"  ❌ Agent failed (attempt {attempt + 1}/{max_retries + 1})")
+                        if task_result.error:
+                            error_preview = task_result.error[:200].replace('\n', ' ')
+                            stage_logger.info(f"  Error: {error_preview}...")
+
+                        # Capture lesson on final attempt
+                        if attempt == max_retries:
+                            self.knowledge.add_lesson(
+                                stage=stage_name,
+                                error_type="task_execution_failed",
+                                error_pattern=task_result.error[:500] if task_result.error else "Unknown error",
+                                error_message=task_result.error[:500] if task_result.error else "Unknown error",
+                                context={"story_id": story_id, "task_index": task.index, "attempts": max_retries + 1},
+                                fix={"description": f"Task {task.index} failed after {max_retries + 1} attempts"},
+                                success=False,
+                                story_id=story_id
+                            )
+
+                        stage_logger.info(f"")
+                        if attempt < max_retries:
+                            continue
+                        else:
+                            stage_logger.error(f"  ❌ Task {task.index} failed after {max_retries + 1} attempts")
+                            stage_logger.info(f"")
+
+                if not task_passed or not task_health_passed:
+                    stage_logger.info(f"{'─'*60}")
+                    stage_logger.error(f"  ❌ Development failed at task {task.index}")
+                    stage_logger.info(f"{'─'*60}")
+                    stage_logger.info(f"")
+                    return False
+
+                stage_logger.info(f"  Progress: {i}/{len(incomplete_tasks)} tasks completed")
+                stage_logger.info(f"")
+
+            stage_logger.info(f"{'='*60}")
+            stage_logger.info(f"  ✅ All {len(incomplete_tasks)} task(s) completed successfully")
+            stage_logger.info(f"{'='*60}")
+            stage_logger.info(f"")
+            return True
+
+        except Exception as e:
+            stage_logger.info(f"")
+            stage_logger.error(f"  ❌ Task decomposition error: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Capture lesson on exception
+            self.knowledge.add_lesson(
+                stage=stage_name,
+                error_type="task_decomposition_exception",
+                error_pattern=str(e),
+                error_message=str(e),
+                context={"story_id": story_id, "story_file": story_file},
+                fix={"description": "Fix task decomposition logic or story file parsing"},
+                success=False,
+                story_id=story_id
+            )
+
+            stage_logger.info(f"")
+            return False
+
+    def _run_test_case_generation_stage(self, story_id: str, story_file: str) -> Tuple[bool, Optional[str]]:
+        """
+        Run test-case-generation stage by spawning agent.
+
+        Enhanced with:
+        - Comprehensive logging at each step
+        - Pre-generation validation (story file, requires tests)
+        - Post-generation health checks (TDM file created)
+        - Detailed error classification and handling
+        - Knowledge base integration
+        - Non-blocking execution (on_failure: continue)
+
+        Args:
+            story_id: Story identifier
+            story_file: Path to story file
+
+        Returns:
+            Tuple of (success, output)
+        """
+        stage_name = "test-case-generation"
+        stage_logger = self._get_stage_logger(stage_name, story_id)
+        stage_logger.info(f"\n{'='*60}")
+        stage_logger.info(f"  STAGE: Test Case Generation (Parallel)")
+        stage_logger.info(f"{'='*60}")
+        stage_logger.info(f"  Story: {story_id}")
+        stage_logger.info(f"  File: {story_file}")
+        stage_logger.info(f"  Blocking: false (runs in parallel)")
+        stage_logger.info(f"")
+
+        # Pre-validation
+        stage_logger.info(f"  [Pre-Generation Validation]")
+        is_valid, validation_msg = self._pre_validate_test_case_generation(story_id, story_file)
+        if not is_valid:
+            stage_logger.error(f"  ⚠ Pre-validation failed: {validation_msg}")
+            stage_logger.info(f"  Skipping test case generation")
+            stage_logger.info(f"")
+            # Not a hard failure - this stage is non-blocking
+            return False, None
+
+        stage_logger.info(f"  ✅ Pre-validation passed: {validation_msg}")
+        stage_logger.info(f"")
+
+        # Get stage config
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            stage_logger.warn(f"  ⚠ Stage config not found for {stage_name}")
+            stage_logger.info(f"")
+            return False, None
+
+        # Get knowledge base lessons
+        limit = self._get_knowledge_limit(stage_name)
+        lessons = self.knowledge.get_lessons_for_stage(stage_name, limit=limit)
+        lesson_ids = [l["id"] for l in lessons]
+
+        if lessons:
+            stage_logger.info(f"  📚 Applying {len(lessons)} lesson(s) from knowledge base")
+            stage_logger.info(f"")
+
+        # Build kwargs for agent
+        kwargs = {
+            'stage_name': stage_name,
+            'story_id': story_id,
+            'story_file': story_file,
+            'autonomy': self.config.autonomy_instructions,
+            'project_root': str(self.project_root),
+            'known_issues': self.knowledge.format_for_prompt(lessons) if lessons else "",
+        }
+
+        # Retry logic
+        max_retries = stage_config.retry.max if stage_config and stage_config.retry else 2
+        on_failure = getattr(stage_config, 'on_failure', 'continue')
+
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                stage_logger.info(f"  🔄 Retry {attempt}/{max_retries}")
+                stage_logger.info(f"")
+
+            # Spawn agent for test case generation
+            stage_logger.info(f"  🚀 Spawning test architect agent...")
+            stage_logger.info(f"  Workflow: /bmad:bmm:workflows:testarch-test-design")
+
+            try:
+                task = self.spawner.spawn_stage(
+                    stage_config,
+                    background=True,
+                    **kwargs
+                )
+
+                # Wait for completion
+                task_result = self._wait_for_task(task, stage_name)
+
+                if task_result.success:
+                    stage_logger.info(f"  ✅ Agent completed (duration: {task_result.duration_seconds:.1f}s)")
+                    stage_logger.info(f"")
+
+                    # Health check: Verify TDM file was created
+                    stage_logger.info(f"  [Post-Generation Health Check]")
+                    health_passed, health_msg = self._verify_tdm_created(story_id)
+
+                    if not health_passed:
+                        stage_logger.error(f"  ❌ Health check failed: {health_msg}")
+                        stage_logger.info(f"")
+
+                        # Capture lesson on health check failure
+                        if attempt == max_retries:
+                            self.knowledge.add_lesson(
+                                stage=stage_name,
+                                error_type="tdm_health_check_failed",
+                                error_pattern=health_msg,
+                                error_message=health_msg,
+                                context={"story_id": story_id, "attempts": max_retries + 1},
+                                fix={"description": f"Agent completed but TDM file not created for {story_id}"},
+                                success=False,
+                                story_id=story_id
+                            )
+
+                        # Retry if we have attempts left
+                        if attempt < max_retries:
+                            continue
+                        else:
+                            stage_logger.error(f"  ⚠ Test case generation failed after {max_retries + 1} attempts")
+                            stage_logger.info(f"")
+                            if on_failure == "continue":
+                                stage_logger.info(f"  Continuing pipeline (on_failure=continue)")
+                                stage_logger.info(f"")
+                            return False, None
+
+                    else:
+                        stage_logger.info(f"  ✅ Health check passed: {health_msg}")
+
+                        # Track prevention if lessons were shown
+                        if lessons and attempt == 0:
+                            self.knowledge.track_prevention(stage_name, lesson_ids)
+                            stage_logger.info(f"  💡 {len(lessons)} lesson(s) helped prevent errors")
+
+                        stage_logger.info(f"")
+                        stage_logger.info(f"{'='*60}")
+                        stage_logger.info(f"  ✅ Test case generation completed")
+                        stage_logger.info(f"{'='*60}")
+                        stage_logger.info(f"")
+                        return True, task_result.output
+
+                else:
+                    stage_logger.error(f"  ❌ Agent failed (attempt {attempt + 1}/{max_retries + 1})")
+                    if task_result.error:
+                        error_preview = task_result.error[:200].replace('\n', ' ')
+                        stage_logger.info(f"  Error: {error_preview}...")
+
+                    # Capture lesson on final attempt
+                    if attempt == max_retries:
+                        self.knowledge.add_lesson(
+                            stage=stage_name,
+                            error_type="test_case_generation_failed",
+                            error_pattern=task_result.error[:500] if task_result.error else "Unknown error",
+                            error_message=task_result.error[:500] if task_result.error else "Unknown error",
+                            context={"story_id": story_id, "attempts": max_retries + 1},
+                            fix={"description": f"Test case generation failed after {max_retries + 1} attempts"},
+                            success=False,
+                            story_id=story_id
+                        )
+
+                    stage_logger.info(f"")
+                    if attempt < max_retries:
+                        continue
+
+            except Exception as e:
+                stage_logger.error(f"  ❌ Exception during test case generation: {e}")
+
+                # Capture lesson on exception
+                if attempt == max_retries:
+                    self.knowledge.add_lesson(
+                        stage=stage_name,
+                        error_type="test_case_generation_exception",
+                        error_pattern=str(e),
+                        error_message=str(e),
+                        context={"story_id": story_id, "attempts": max_retries + 1},
+                        fix={"description": "Fix test case generation spawning or execution"},
+                        success=False,
+                        story_id=story_id
+                    )
+
+                stage_logger.info(f"")
+                if attempt < max_retries:
+                    continue
+
+        # All retries exhausted
+        stage_logger.error(f"  ⚠ Test case generation failed after {max_retries + 1} attempts")
+        stage_logger.info(f"")
+        if on_failure == "continue":
+            stage_logger.info(f"  Continuing pipeline (on_failure=continue)")
+            stage_logger.info(f"")
+        return False, None
+
+    # ============================================
+    # QUALITY STAGES (Lint, Typecheck, Unit-Test)
+    # ============================================
+
+    def _run_lint_stage(self, story_id: str, story_file: str) -> Tuple[bool, Optional[str]]:
+        """
+        Run lint stage by spawning agent.
+
+        Enhanced with:
+        - Comprehensive logging with timestamps
+        - Knowledge base integration
+        - Retry logic with fixes
+        - Error classification
+        - Stage-specific log files
+
+        Returns:
+            Tuple of (success, output)
+        """
+        stage_name = "lint"
+        stage_logger = self._get_stage_logger(stage_name, story_id)
+        stage_start_time = time.time()
+
+        stage_logger.info(f"\n{'='*60}")
+        stage_logger.info(f"  STAGE: Lint")
+        stage_logger.info(f"{'='*60}")
+        stage_logger.info(f"  Story: {story_id}")
+        stage_logger.info(f"  Start Time: {datetime.fromtimestamp(stage_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+        stage_logger.info(f"")
+
+        # Get stage config
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            stage_logger.warn(f"  ⚠ Stage config not found for {stage_name}")
+            stage_logger.info(f"")
+            return False, None
+
+        # Get knowledge base lessons
+        limit = self._get_knowledge_limit(stage_name)
+        lessons = self.knowledge.get_lessons_for_stage(stage_name, limit=limit)
+        lesson_ids = [l["id"] for l in lessons]
+
+        if lessons:
+            stage_logger.info(f"  📚 Applying {len(lessons)} lesson(s) from knowledge base")
+            stage_logger.info(f"")
+
+        # Build kwargs for agent
+        kwargs = {
+            'stage_name': stage_name,
+            'story_id': story_id,
+            'story_file': story_file,
+            'autonomy': self.config.autonomy_instructions,
+            'project_root': str(self.project_root),
+            'known_issues': self.knowledge.format_for_prompt(lessons) if lessons else "",
+        }
+
+        # Retry logic
+        max_retries = stage_config.retry.max if stage_config and stage_config.retry else 3
+        on_failure = getattr(stage_config, 'on_failure', 'abort')
+
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                stage_logger.info(f"  🔄 Retry {attempt}/{max_retries}")
+                stage_logger.info(f"")
+
+            stage_logger.info(f"  🚀 Spawning lint agent...")
+
+            try:
+                task = self.spawner.spawn_stage(
+                    stage_config,
+                    background=True,
+                    **kwargs
+                )
+
+                task_result = self._wait_for_task(task, stage_name)
+
+                if task_result.success:
+                    stage_end_time = time.time()
+                    stage_logger.info(f"  ✅ Lint checks passed (duration: {task_result.duration_seconds:.1f}s)")
+
+                    # Track prevention if lessons were shown
+                    if lessons and attempt == 0:
+                        self.knowledge.track_prevention(stage_name, lesson_ids)
+                        stage_logger.info(f"  💡 {len(lessons)} lesson(s) helped prevent errors")
+
+                    stage_logger.info(f"")
+
+                    # Write comprehensive log to file
+                    self._log_stage_execution(
+                        story_id=story_id,
+                        stage_name=stage_name,
+                        start_time=stage_start_time,
+                        end_time=stage_end_time,
+                        task_result=task_result,
+                        additional_info={
+                            'Attempt': f"{attempt + 1}/{max_retries + 1}",
+                            'Lessons Applied': len(lessons),
+                            'Status': 'SUCCESS'
+                        }
+                    )
+
+                    stage_logger.info(f"")
+                    stage_logger.info(f"{'='*60}")
+                    stage_logger.info(f"  ✅ Lint stage completed")
+                    stage_logger.info(f"{'='*60}")
+                    stage_logger.info(f"  End Time: {datetime.fromtimestamp(stage_end_time).strftime('%Y-%m-%d %H:%M:%S')}")
+                    stage_logger.info(f"")
+                    return True, task_result.output
+
+                else:
+                    stage_logger.error(f"  ❌ Lint checks failed (attempt {attempt + 1}/{max_retries + 1})")
+                    if task_result.error:
+                        error_preview = task_result.error[:200].replace('\n', ' ')
+                        stage_logger.info(f"  Error: {error_preview}...")
+
+                    # Capture lesson on final attempt
+                    if attempt == max_retries:
+                        self.knowledge.add_lesson(
+                            stage=stage_name,
+                            error_type="lint_failed",
+                            error_pattern=task_result.error[:500] if task_result.error else "Unknown error",
+                            error_message=task_result.error[:500] if task_result.error else "Unknown error",
+                            context={"story_id": story_id, "attempts": max_retries + 1},
+                            fix={"description": f"Lint failed after {max_retries + 1} attempts"},
+                            success=False,
+                            story_id=story_id
+                        )
+
+                    stage_logger.info(f"")
+                    if attempt < max_retries:
+                        continue
+
+            except Exception as e:
+                stage_logger.error(f"  ❌ Exception during lint: {e}")
+
+                if attempt == max_retries:
+                    self.knowledge.add_lesson(
+                        stage=stage_name,
+                        error_type="lint_exception",
+                        error_pattern=str(e),
+                        error_message=str(e),
+                        context={"story_id": story_id, "attempts": max_retries + 1},
+                        fix={"description": "Fix lint execution"},
+                        success=False,
+                        story_id=story_id
+                    )
+
+                stage_logger.info(f"")
+                if attempt < max_retries:
+                    continue
+
+        # All retries exhausted
+        stage_end_time = time.time()
+        stage_logger.error(f"  ❌ Lint failed after {max_retries + 1} attempts")
+        stage_logger.info(f"")
+
+        # Write failure log to file
+        self._log_stage_execution(
+            story_id=story_id,
+            stage_name=stage_name,
+            start_time=stage_start_time,
+            end_time=stage_end_time,
+            task_result=None,
+            additional_info={
+                'Attempts': f"{max_retries + 1}",
+                'Lessons Applied': len(lessons),
+                'Status': 'FAILED (all retries exhausted)'
+            }
+        )
+
+        stage_logger.info(f"  End Time: {datetime.fromtimestamp(stage_end_time).strftime('%Y-%m-%d %H:%M:%S')}")
+        stage_logger.info(f"")
+        return False, None
+
+    def _run_typecheck_stage(self, story_id: str, story_file: str) -> Tuple[bool, Optional[str]]:
+        """
+        Run typecheck stage by spawning agent.
+
+        Enhanced with:
+        - Comprehensive logging
+        - Knowledge base integration
+        - Retry logic with fixes
+        - Error classification
+
+        Returns:
+            Tuple of (success, output)
+        """
+        stage_name = "typecheck"
+        stage_logger = self._get_stage_logger(stage_name, story_id)
+        stage_logger.info(f"\n{'='*60}")
+        stage_logger.info(f"  STAGE: Typecheck")
+        stage_logger.info(f"{'='*60}")
+        stage_logger.info(f"  Story: {story_id}")
+        stage_logger.info(f"")
+
+        # Get stage config
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            stage_logger.warn(f"  ⚠ Stage config not found for {stage_name}")
+            stage_logger.info(f"")
+            return False, None
+
+        # Get knowledge base lessons
+        limit = self._get_knowledge_limit(stage_name)
+        lessons = self.knowledge.get_lessons_for_stage(stage_name, limit=limit)
+        lesson_ids = [l["id"] for l in lessons]
+
+        if lessons:
+            stage_logger.info(f"  📚 Applying {len(lessons)} lesson(s) from knowledge base")
+            stage_logger.info(f"")
+
+        # Build kwargs for agent
+        kwargs = {
+            'stage_name': stage_name,
+            'story_id': story_id,
+            'story_file': story_file,
+            'autonomy': self.config.autonomy_instructions,
+            'project_root': str(self.project_root),
+            'known_issues': self.knowledge.format_for_prompt(lessons) if lessons else "",
+        }
+
+        # Retry logic
+        max_retries = stage_config.retry.max if stage_config and stage_config.retry else 2
+        on_failure = getattr(stage_config, 'on_failure', 'abort')
+
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                stage_logger.info(f"  🔄 Retry {attempt}/{max_retries}")
+                stage_logger.info(f"")
+
+            stage_logger.info(f"  🚀 Spawning typecheck agent...")
+
+            try:
+                task = self.spawner.spawn_stage(
+                    stage_config,
+                    background=True,
+                    **kwargs
+                )
+
+                task_result = self._wait_for_task(task, stage_name)
+
+                if task_result.success:
+                    stage_logger.info(f"  ✅ Type checks passed (duration: {task_result.duration_seconds:.1f}s)")
+
+                    # Track prevention if lessons were shown
+                    if lessons and attempt == 0:
+                        self.knowledge.track_prevention(stage_name, lesson_ids)
+                        stage_logger.info(f"  💡 {len(lessons)} lesson(s) helped prevent errors")
+
+                    stage_logger.info(f"")
+                    stage_logger.info(f"{'='*60}")
+                    stage_logger.info(f"  ✅ Typecheck stage completed")
+                    stage_logger.info(f"{'='*60}")
+                    stage_logger.info(f"")
+                    return True, task_result.output
+
+                else:
+                    stage_logger.error(f"  ❌ Type checks failed (attempt {attempt + 1}/{max_retries + 1})")
+                    if task_result.error:
+                        error_preview = task_result.error[:200].replace('\n', ' ')
+                        stage_logger.info(f"  Error: {error_preview}...")
+
+                    # Capture lesson on final attempt
+                    if attempt == max_retries:
+                        self.knowledge.add_lesson(
+                            stage=stage_name,
+                            error_type="typecheck_failed",
+                            error_pattern=task_result.error[:500] if task_result.error else "Unknown error",
+                            error_message=task_result.error[:500] if task_result.error else "Unknown error",
+                            context={"story_id": story_id, "attempts": max_retries + 1},
+                            fix={"description": f"Typecheck failed after {max_retries + 1} attempts"},
+                            success=False,
+                            story_id=story_id
+                        )
+
+                    stage_logger.info(f"")
+                    if attempt < max_retries:
+                        continue
+
+            except Exception as e:
+                stage_logger.error(f"  ❌ Exception during typecheck: {e}")
+
+                if attempt == max_retries:
+                    self.knowledge.add_lesson(
+                        stage=stage_name,
+                        error_type="typecheck_exception",
+                        error_pattern=str(e),
+                        error_message=str(e),
+                        context={"story_id": story_id, "attempts": max_retries + 1},
+                        fix={"description": "Fix typecheck execution"},
+                        success=False,
+                        story_id=story_id
+                    )
+
+                stage_logger.info(f"")
+                if attempt < max_retries:
+                    continue
+
+        # All retries exhausted
+        stage_logger.error(f"  ❌ Typecheck failed after {max_retries + 1} attempts")
+        stage_logger.info(f"")
+        return False, None
+
+    def _run_unit_test_stage(self, story_id: str, story_file: str) -> Tuple[bool, Optional[str]]:
+        """
+        Run unit-test stage by spawning agent.
+
+        Enhanced with:
+        - Comprehensive logging
+        - Knowledge base integration
+        - Retry logic with fixes
+        - Error classification
+
+        Returns:
+            Tuple of (success, output)
+        """
+        stage_name = "unit-test"
+        stage_logger = self._get_stage_logger(stage_name, story_id)
+        stage_logger.info(f"\n{'='*60}")
+        stage_logger.info(f"  STAGE: Unit Tests")
+        stage_logger.info(f"{'='*60}")
+        stage_logger.info(f"  Story: {story_id}")
+        stage_logger.info(f"")
+
+        # Get stage config
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            stage_logger.warn(f"  ⚠ Stage config not found for {stage_name}")
+            stage_logger.info(f"")
+            return False, None
+
+        # Get knowledge base lessons
+        limit = self._get_knowledge_limit(stage_name)
+        lessons = self.knowledge.get_lessons_for_stage(stage_name, limit=limit)
+        lesson_ids = [l["id"] for l in lessons]
+
+        if lessons:
+            stage_logger.info(f"  📚 Applying {len(lessons)} lesson(s) from knowledge base")
+            stage_logger.info(f"")
+
+        # Build kwargs for agent
+        kwargs = {
+            'stage_name': stage_name,
+            'story_id': story_id,
+            'story_file': story_file,
+            'autonomy': self.config.autonomy_instructions,
+            'project_root': str(self.project_root),
+            'known_issues': self.knowledge.format_for_prompt(lessons) if lessons else "",
+        }
+
+        # Retry logic
+        max_retries = stage_config.retry.max if stage_config and stage_config.retry else 3
+        on_failure = getattr(stage_config, 'on_failure', 'abort')
+
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                stage_logger.info(f"  🔄 Retry {attempt}/{max_retries}")
+                stage_logger.info(f"")
+
+            stage_logger.info(f"  🚀 Spawning unit test agent...")
+
+            try:
+                task = self.spawner.spawn_stage(
+                    stage_config,
+                    background=True,
+                    **kwargs
+                )
+
+                task_result = self._wait_for_task(task, stage_name)
+
+                if task_result.success:
+                    stage_logger.info(f"  ✅ All unit tests passed (duration: {task_result.duration_seconds:.1f}s)")
+
+                    # Track prevention if lessons were shown
+                    if lessons and attempt == 0:
+                        self.knowledge.track_prevention(stage_name, lesson_ids)
+                        stage_logger.info(f"  💡 {len(lessons)} lesson(s) helped prevent errors")
+
+                    stage_logger.info(f"")
+                    stage_logger.info(f"{'='*60}")
+                    stage_logger.info(f"  ✅ Unit test stage completed")
+                    stage_logger.info(f"{'='*60}")
+                    stage_logger.info(f"")
+                    return True, task_result.output
+
+                else:
+                    stage_logger.error(f"  ❌ Unit tests failed (attempt {attempt + 1}/{max_retries + 1})")
+                    if task_result.error:
+                        error_preview = task_result.error[:200].replace('\n', ' ')
+                        stage_logger.info(f"  Error: {error_preview}...")
+
+                    # Capture lesson on final attempt
+                    if attempt == max_retries:
+                        self.knowledge.add_lesson(
+                            stage=stage_name,
+                            error_type="unit_test_failed",
+                            error_pattern=task_result.error[:500] if task_result.error else "Unknown error",
+                            error_message=task_result.error[:500] if task_result.error else "Unknown error",
+                            context={"story_id": story_id, "attempts": max_retries + 1},
+                            fix={"description": f"Unit tests failed after {max_retries + 1} attempts"},
+                            success=False,
+                            story_id=story_id
+                        )
+
+                    stage_logger.info(f"")
+                    if attempt < max_retries:
+                        continue
+
+            except Exception as e:
+                stage_logger.error(f"  ❌ Exception during unit tests: {e}")
+
+                if attempt == max_retries:
+                    self.knowledge.add_lesson(
+                        stage=stage_name,
+                        error_type="unit_test_exception",
+                        error_pattern=str(e),
+                        error_message=str(e),
+                        context={"story_id": story_id, "attempts": max_retries + 1},
+                        fix={"description": "Fix unit test execution"},
+                        success=False,
+                        story_id=story_id
+                    )
+
+                stage_logger.info(f"")
+                if attempt < max_retries:
+                    continue
+
+        # All retries exhausted
+        stage_logger.error(f"  ❌ Unit tests failed after {max_retries + 1} attempts")
+        stage_logger.info(f"")
+        return False, None
+
+    # ============================================
+    # DEPLOY-LOCAL STAGE
+    # ============================================
+
+    def _verify_app_running(self, deploy_info_file: Path) -> Tuple[bool, str]:
+        """
+        Verify application is running after deployment.
+
+        Checks:
+        - Deploy info file exists
+        - Application URL is accessible
+        - Health status is 'healthy'
+
+        Returns:
+            Tuple of (health_passed, message)
+        """
+        try:
+            if not deploy_info_file.exists():
+                return False, "Deploy info file not found"
+
+            content = safe_read(deploy_info_file)
+            if not content:
+                return False, "Deploy info file is empty"
+
+            # Parse deployment info
+            # Expected format: key: value lines
+            info = {}
+            for line in content.split('\n'):
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    info[key.strip()] = value.strip()
+
+            # Check for required fields
+            if 'Application URL' not in info:
+                return False, "Application URL not found in deploy info"
+
+            if 'Health status' not in info:
+                return False, "Health status not found in deploy info"
+
+            health_status = info.get('Health status', '').lower()
+            if health_status != 'healthy':
+                return False, f"Application health status: {health_status}"
+
+            app_url = info['Application URL']
+            return True, f"Application running at {app_url}"
+
+        except Exception as e:
+            return False, f"Health check failed: {e}"
+
+    def _run_deploy_local_stage(self, story_id: str, story_file: str) -> Tuple[bool, Optional[str]]:
+        """
+        Run deploy-local stage by spawning agent.
+
+        Enhanced with:
+        - Comprehensive logging
+        - Post-deployment health checks
+        - Knowledge base integration
+        - Retry logic
+        - Error classification
+
+        Returns:
+            Tuple of (success, output)
+        """
+        stage_name = "deploy-local"
+        stage_logger = self._get_stage_logger(stage_name, story_id)
+        self.logger.info(f"\n{'='*60}")
+        self.logger.info(f"  STAGE: Deploy Local")
+        self.logger.info(f"{'='*60}")
+        self.logger.info(f"  Story: {story_id}")
+        self.logger.info(f"")
+
+        # Check if story requires deployment (same logic as test-case-generation)
+        requires_deploy, reason = self._story_requires_tests(story_id, story_file)
+        if not requires_deploy:
+            stage_logger.warn(f"  ⚠ Skipping deployment: {reason}")
+            stage_logger.info(f"")
+            return True, "Skipped (story does not require deployment)"
+
+        stage_logger.info(f"  Deployment required: {reason}")
+        stage_logger.info(f"")
+
+        # Get stage config
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config:
+            stage_logger.warn(f"  ⚠ Stage config not found for {stage_name}")
+            stage_logger.info(f"")
+            return False, None
+
+        # Get knowledge base lessons
+        limit = self._get_knowledge_limit(stage_name)
+        lessons = self.knowledge.get_lessons_for_stage(stage_name, limit=limit)
+        lesson_ids = [l["id"] for l in lessons]
+
+        if lessons:
+            stage_logger.info(f"  📚 Applying {len(lessons)} lesson(s) from knowledge base")
+            stage_logger.info(f"")
+
+        # Build kwargs for agent
+        kwargs = {
+            'stage_name': stage_name,
+            'story_id': story_id,
+            'autonomy': self.config.autonomy_instructions,
+            'project_root': str(self.project_root),
+            'known_issues': self.knowledge.format_for_prompt(lessons) if lessons else "",
+        }
+
+        # Retry logic
+        max_retries = stage_config.retry.max if stage_config and stage_config.retry else 2
+        on_failure = getattr(stage_config, 'on_failure', 'abort')
+
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                stage_logger.info(f"  🔄 Retry {attempt}/{max_retries}")
+                stage_logger.info(f"")
+
+            stage_logger.info(f"  🚀 Spawning deployment agent...")
+
+            try:
+                task = self.spawner.spawn_stage(
+                    stage_config,
+                    background=True,
+                    **kwargs
+                )
+
+                task_result = self._wait_for_task(task, stage_name)
+
+                if task_result.success:
+                    stage_logger.info(f"  ✅ Deployment completed (duration: {task_result.duration_seconds:.1f}s)")
+                    stage_logger.info(f"")
+
+                    # Health check: Verify app is running
+                    stage_logger.info(f"  [Post-Deployment Health Check]")
+                    deploy_info_file = self.project_root / ".orchestrate-temp/deploy-local.txt"
+                    health_passed, health_msg = self._verify_app_running(deploy_info_file)
+
+                    if not health_passed:
+                        stage_logger.error(f"  ❌ Health check failed: {health_msg}")
+                        stage_logger.info(f"")
+
+                        # Capture lesson on health check failure
+                        if attempt == max_retries:
+                            self.knowledge.add_lesson(
+                                stage=stage_name,
+                                error_type="deployment_health_check_failed",
+                                error_pattern=health_msg,
+                                error_message=health_msg,
+                                context={"story_id": story_id, "attempts": max_retries + 1},
+                                fix={"description": f"Deployment completed but app not running"},
+                                success=False,
+                                story_id=story_id
+                            )
+
+                        # Retry if we have attempts left
+                        if attempt < max_retries:
+                            continue
+                        else:
+                            stage_logger.error(f"  ❌ Deployment failed health check after {max_retries + 1} attempts")
+                            stage_logger.info(f"")
+                            return False, None
+
+                    else:
+                        stage_logger.info(f"  ✅ Health check passed: {health_msg}")
+
+                        # Track prevention if lessons were shown
+                        if lessons and attempt == 0:
+                            self.knowledge.track_prevention(stage_name, lesson_ids)
+                            stage_logger.info(f"  💡 {len(lessons)} lesson(s) helped prevent errors")
+
+                        stage_logger.info(f"")
+                        stage_logger.info(f"{'='*60}")
+                        stage_logger.info(f"  ✅ Deploy local stage completed")
+                        stage_logger.info(f"{'='*60}")
+                        stage_logger.info(f"")
+                        return True, task_result.output
+
+                else:
+                    stage_logger.error(f"  ❌ Deployment failed (attempt {attempt + 1}/{max_retries + 1})")
+                    if task_result.error:
+                        error_preview = task_result.error[:200].replace('\n', ' ')
+                        stage_logger.info(f"  Error: {error_preview}...")
+
+                    # Capture lesson on final attempt
+                    if attempt == max_retries:
+                        self.knowledge.add_lesson(
+                            stage=stage_name,
+                            error_type="deployment_failed",
+                            error_pattern=task_result.error[:500] if task_result.error else "Unknown error",
+                            error_message=task_result.error[:500] if task_result.error else "Unknown error",
+                            context={"story_id": story_id, "attempts": max_retries + 1},
+                            fix={"description": f"Deployment failed after {max_retries + 1} attempts"},
+                            success=False,
+                            story_id=story_id
+                        )
+
+                    stage_logger.info(f"")
+                    if attempt < max_retries:
+                        continue
+
+            except Exception as e:
+                stage_logger.error(f"  ❌ Exception during deployment: {e}")
+
+                if attempt == max_retries:
+                    self.knowledge.add_lesson(
+                        stage=stage_name,
+                        error_type="deployment_exception",
+                        error_pattern=str(e),
+                        error_message=str(e),
+                        context={"story_id": story_id, "attempts": max_retries + 1},
+                        fix={"description": "Fix deployment execution"},
+                        success=False,
+                        story_id=story_id
+                    )
+
+                stage_logger.info(f"")
+                if attempt < max_retries:
+                    continue
+
+        # All retries exhausted
+        stage_logger.error(f"  ❌ Deployment failed after {max_retries + 1} attempts")
+        stage_logger.info(f"")
+        return False, None
+
+    def _run_code_review_stage(self, story_id: str, story_file: str, files_changed: list) -> Tuple[bool, Optional[str]]:
+        """
+        Run code-review stage by spawning agent.
+
+        Enhanced with:
+        - Comprehensive logging
+        - Knowledge base integration
+        - Review result parsing
+        - Status update to "review"
+        - Error classification
+
+        Args:
+            story_id: Story identifier
+            story_file: Path to story file
+            files_changed: List of changed files to review
+
+        Returns:
+            Tuple of (success, output)
+        """
+        stage_name = "code-review"
+        stage_logger = self._get_stage_logger(stage_name, story_id)
+        stage_logger.info(f"\n{'='*60}")
+        stage_logger.info(f"  STAGE: Code Review")
+        stage_logger.info(f"{'='*60}")
+        stage_logger.info(f"  Story: {story_id}")
+        stage_logger.info(f"  Files changed: {len(files_changed)}")
+        stage_logger.info(f"")
+
+        # Get stage config
+        stage_config = self.config.stages.get(stage_name)
+        if not stage_config or not stage_config.enabled:
+            stage_logger.warn(f"  ⚠ Code review stage not enabled")
+            return True, "SKIP"
+
+        # Get knowledge base lessons
+        limit = self._get_knowledge_limit(stage_name)
+        lessons = self.knowledge.get_lessons_for_stage(stage_name, limit=limit)
+        lesson_ids = [l["id"] for l in lessons]
+
+        if lessons:
+            stage_logger.info(f"  📚 Applying {len(lessons)} lesson(s) from knowledge base")
+            stage_logger.info(f"")
+
+        # Build kwargs for agent
+        files_changed_str = ", ".join(files_changed) if files_changed else "No files changed"
+        kwargs = {
+            'stage_name': stage_name,
+            'story_id': story_id,
+            'story_file': story_file,
+            'autonomy': self.config.autonomy_instructions,
+            'project_root': str(self.project_root),
+            'known_issues': self.knowledge.format_for_prompt(lessons) if lessons else "",
+            'files_changed': files_changed_str,
+        }
+
+        # Retry logic (max 1 retry since code-review is non-blocking)
+        max_retries = stage_config.retry.max if stage_config and stage_config.retry else 1
+
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                stage_logger.info(f"  🔄 Retry {attempt}/{max_retries}")
+                stage_logger.info(f"")
+
+            try:
+                stage_logger.info(f"  🚀 Spawning code review agent...")
+                stage_logger.info(f"")
+
+                task = self.spawner.spawn_stage(stage_config, background=True, **kwargs)
+                task_result = self._wait_for_task(task, stage_name)
+
+                if task_result.success:
+                    stage_logger.info(f"  ✅ Code review completed (duration: {task_result.duration_seconds:.1f}s)")
+                    stage_logger.info(f"")
+
+                    # Parse review result to detect issues
+                    output_lower = (task_result.output or "").lower()
+
+                    # Look for indicators of issues found
+                    issues_found = False
+                    issue_count = 0
+
+                    if "no issues" in output_lower or "looks good" in output_lower or "approved" in output_lower:
+                        issues_found = False
+                        stage_logger.info(f"  ✅ Code review PASSED: No issues found")
+                    elif "issue" in output_lower or "concern" in output_lower or "problem" in output_lower:
+                        # Try to count issues
+                        issue_matches = re.findall(r'(\d+)\s+issue', output_lower)
+                        if issue_matches:
+                            issue_count = int(issue_matches[0])
+                            issues_found = True
+                            stage_logger.warn(f"  ⚠ Code review found {issue_count} issue(s)")
+                        else:
+                            issues_found = True
+                            stage_logger.warn(f"  ⚠ Code review found issues (count unknown)")
+                    else:
+                        # Neutral result
+                        stage_logger.info(f"  ✅ Code review completed (no clear pass/fail)")
+
+                    stage_logger.info(f"")
+
+                    # Update story status to "review"
+                    stage_logger.info(f"  [Status Update]")
+                    self._update_story_status(story_id, "review")
+                    stage_logger.info(f"  ✅ Story status updated to 'review'")
+                    stage_logger.info(f"")
+
+                    # Track prevention if lessons were shown
+                    if lessons and attempt == 0:
+                        self.knowledge.track_prevention(stage_name, lesson_ids)
+                        stage_logger.info(f"  💡 {len(lessons)} lesson(s) helped prevent errors")
+                        stage_logger.info(f"")
+
+                    stage_logger.info(f"{'='*60}")
+                    stage_logger.info(f"  ✅ Code review stage completed")
+                    stage_logger.info(f"{'='*60}")
+                    stage_logger.info(f"")
+
+                    # Return true even if issues found (non-blocking)
+                    return True, task_result.output
+
+                else:
+                    stage_logger.error(f"  ❌ Code review failed (attempt {attempt + 1}/{max_retries + 1})")
+                    if task_result.error:
+                        error_preview = task_result.error[:200].replace('\n', ' ')
+                        stage_logger.info(f"  Error: {error_preview}...")
+                    stage_logger.info(f"")
+
+                    # Capture lesson on final attempt
+                    if attempt == max_retries:
+                        self.knowledge.add_lesson(
+                            stage=stage_name,
+                            error_type="code_review_failed",
+                            error_pattern=task_result.error[:500] if task_result.error else "Unknown error",
+                            error_message=task_result.error[:500] if task_result.error else "Unknown error",
+                            context={"story_id": story_id, "attempts": max_retries + 1},
+                            fix={"description": f"Code review failed after {max_retries + 1} attempts"},
+                            success=False,
+                            story_id=story_id
+                        )
+
+                    if attempt < max_retries:
+                        continue
+
+            except Exception as e:
+                stage_logger.error(f"  ❌ Exception during code review: {e}")
+                stage_logger.info(f"")
+
+                if attempt == max_retries:
+                    self.knowledge.add_lesson(
+                        stage=stage_name,
+                        error_type="code_review_exception",
+                        error_pattern=str(e),
+                        error_message=str(e),
+                        context={"story_id": story_id, "attempts": max_retries + 1},
+                        fix={"description": "Fix code review execution"},
+                        success=False,
+                        story_id=story_id
+                    )
+
+                if attempt < max_retries:
+                    continue
+
+        # All retries exhausted (but code-review is non-blocking, so return True)
+        stage_logger.error(f"  ⚠ Code review failed after {max_retries + 1} attempts (non-blocking)")
+        stage_logger.info(f"")
+        return True, "FAIL"
+
+    def _update_story_status(self, story_id: str, new_status: str) -> None:
+        """
+        Update story status in sprint-status.yaml.
+
+        Args:
+            story_id: Story identifier
+            new_status: New status value (drafted, ready-for-dev, in-progress, review, done)
+        """
+        try:
+            # Find sprint-status.yaml file
+            sprint_status_locations = [
+                self.project_root / "docs/sprint-artifacts/sprint-status.yaml",
+                self.project_root / "docs/stories/sprint-status.yaml",
+                self.project_root / "state/sprint-status.yaml",
+            ]
+
+            sprint_status_file = None
+            for location in sprint_status_locations:
+                if location.exists():
+                    sprint_status_file = location
+                    break
+
+            if not sprint_status_file:
+                self.logger.warn(f"  ⚠ sprint-status.yaml not found, skipping status update")
+                return
+
+            # Read current status file
+            content = safe_read(sprint_status_file)
+            data = yaml.safe_load(content) or {}
+
+            # Update story status
+            if 'development_status' not in data:
+                data['development_status'] = {}
+
+            old_status = data['development_status'].get(story_id, 'unknown')
+            data['development_status'][story_id] = new_status
+
+            # Write back
+            updated_content = yaml.dump(data, default_flow_style=False, sort_keys=False)
+            safe_write(sprint_status_file, updated_content)
+
+            self.logger.info(f"  Story status updated: {story_id}: {old_status} → {new_status}")
+
+        except Exception as e:
+            self.logger.warn(f"  ⚠ Could not update story status: {e}")
+
+    def _log_stage_execution(
+        self,
+        story_id: str,
+        stage_name: str,
+        start_time: float,
+        end_time: float,
+        task_result: Optional['TaskResult'] = None,
+        additional_info: Optional[dict] = None
+    ) -> None:
+        """
+        Log stage execution details to a stage-specific log file.
+
+        Creates: .orchestrate-temp/logs/stories/{story_id}/{stage_name}.log
+
+        Logs:
+        - Start and end timestamps
+        - Duration
+        - Success/failure status
+        - Agent output (stdout/stderr)
+        - Additional info (e.g., files changed, retry attempts)
+
+        Args:
+            story_id: Story identifier
+            stage_name: Name of the stage
+            start_time: Unix timestamp when stage started
+            end_time: Unix timestamp when stage ended
+            task_result: TaskResult from spawned agent (if any)
+            additional_info: Dictionary of extra info to log
+        """
+        try:
+            # Create log directory
+            log_dir = self.project_root / ".orchestrate-temp/logs/stories" / story_id
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            log_file = log_dir / f"{stage_name}.log"
+
+            # Format timestamps
+            start_dt = datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S")
+            end_dt = datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S")
+            duration = end_time - start_time
+
+            # Build log content
+            log_lines = []
+            log_lines.append("=" * 80)
+            log_lines.append(f"STAGE EXECUTION LOG: {stage_name}")
+            log_lines.append("=" * 80)
+            log_lines.append(f"Story ID: {story_id}")
+            log_lines.append(f"Start Time: {start_dt} ({start_time})")
+            log_lines.append(f"End Time: {end_dt} ({end_time})")
+            log_lines.append(f"Duration: {duration:.2f} seconds")
+            log_lines.append("")
+
+            # Additional info
+            if additional_info:
+                log_lines.append("Additional Information:")
+                log_lines.append("-" * 80)
+                for key, value in additional_info.items():
+                    log_lines.append(f"{key}: {value}")
+                log_lines.append("")
+
+            # Task result details
+            if task_result:
+                log_lines.append("Agent Execution Result:")
+                log_lines.append("-" * 80)
+                log_lines.append(f"Success: {task_result.success}")
+                log_lines.append(f"Exit Code: {task_result.exit_code}")
+                log_lines.append(f"Status: {task_result.status.value if hasattr(task_result.status, 'value') else task_result.status}")
+                log_lines.append(f"Duration (agent): {task_result.duration_seconds:.2f} seconds")
+                log_lines.append("")
+
+                # Agent output (stdout)
+                if task_result.output:
+                    log_lines.append("Agent Output (stdout):")
+                    log_lines.append("-" * 80)
+                    log_lines.append(task_result.output)
+                    log_lines.append("")
+
+                # Agent errors (stderr)
+                if task_result.error:
+                    log_lines.append("Agent Errors (stderr):")
+                    log_lines.append("-" * 80)
+                    log_lines.append(task_result.error)
+                    log_lines.append("")
+
+            log_lines.append("=" * 80)
+            log_lines.append(f"END OF LOG: {stage_name}")
+            log_lines.append("=" * 80)
+
+            # Write to file
+            content = "\n".join(log_lines) + "\n"
+            with open(log_file, 'a') as f:
+                f.write(content)
+
+            self.logger.info(f"  📝 Stage log written to: {log_file.relative_to(self.project_root)}")
+
+        except Exception as e:
+            self.logger.warn(f"  ⚠ Could not write stage log: {e}")
+
+    def _wait_for_task(
+        self,
+        task: BackgroundTask,
+        stage_name: str,
+        poll_interval: float = 1.0,
+    ) -> TaskResult:
+        """Wait for a background task with progress display."""
+        self.logger.info(f"  Waiting for {stage_name}...")
+
+        last_log = time.time()
+        while not task.is_done():
+            time.sleep(poll_interval)
+            elapsed = task.elapsed_seconds()
+
+            # Log progress every 1 second for real-time updates
+            if time.time() - last_log >= 1:
+                self.logger.info(f"    ... {stage_name} still running ({elapsed:.0f}s)")
+                last_log = time.time()
+
+        result = task.get_result(block=False)
+        self.logger.info(f"  {stage_name} completed: success={result.success}, duration={result.duration_seconds:.1f}s")
+
+        if not result.success and result.error:
+            error_preview = result.error[:500] if result.error else ""
+            self.logger.info(f"    Error: {error_preview}...")
+
+        return result
+
+    def _get_changed_files(self, limit: int = 20) -> List[str]:
+        """Get list of changed files from git."""
+        try:
+            result = subprocess.run(
+                ['git', 'diff', '--name-only', 'HEAD'],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode == 0:
+                files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
+                filtered_files = []
+                for file_path in files[:limit]:
+                    full_path = self.project_root / file_path
+                    if not full_path.exists():
+                        continue
+                    if full_path.stat().st_size > 100 * 1024:
+                        continue
+                    if file_path.endswith(('.png', '.jpg', '.jpeg', '.gif', '.pdf', '.zip', '.tar', '.gz')):
+                        continue
+                    filtered_files.append(file_path)
+                return filtered_files
+
+        except Exception as e:
+            self.logger.warn(f"  Warning: Could not get changed files: {e}")
+
+        return []
+
+    def _get_current_branch(self) -> Optional[str]:
+        """Get current git branch name."""
+        try:
+            result = subprocess.run(
+                ['git', 'branch', '--show-current'],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception as e:
+            self.logger.warn(f"  Warning: Could not get branch name: {e}")
+        return None
+
+    def _get_pr_url(self, branch_name: Optional[str]) -> Optional[str]:
+        """Get PR URL for current branch using gh CLI."""
+        if not branch_name:
+            return None
+
+        try:
+            result = subprocess.run(
+                ['gh', 'pr', 'view', branch_name, '--json', 'url', '-q', '.url'],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception as e:
+            log(f"  Warning: Could not get PR URL: {e}")
+        return None
+
+    def _print_summary(self, result: PipelineResult) -> None:
+        """Print final summary."""
+        log("\n" + "=" * 60)
+        log("ORCHESTRATE-AUTO-DEV COMPLETE")
+        log("=" * 60)
+        log(f"Story ID: {result.story_id}")
+        log(f"Story File: {result.story_file}")
+        if result.branch_name:
+            log(f"Branch: {result.branch_name}")
+        if result.pr_url:
+            log(f"PR URL: {result.pr_url}")
+        log(f"Status: {'SUCCESS' if result.success else 'FAILED'}")
+        log("")
+        log("Stage Results:")
+        for stage, status in result.stage_results.items():
+            if status == "PASS":
+                marker = "✓"
+            elif status == "SKIP":
+                marker = "○"
+            else:
+                marker = "✗"
+            log(f"  {marker} {stage}: {status}")
+
+        if result.error:
+            log(f"\nError: {result.error}")
+
+        log("=" * 60)
