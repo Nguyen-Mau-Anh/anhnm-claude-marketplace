@@ -10,6 +10,7 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+.claude-relay
 
 # Local settings (keep .claude but ignore local settings)
 .claude/settings.local.json
