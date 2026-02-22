@@ -117,9 +117,9 @@ function validateMarketplace() {
         errors.push('Plugin entry missing name');
         log.error('Plugin entry missing name');
       }
-      if (!plugin.path) {
-        errors.push(`Plugin "${plugin.name || 'unknown'}" missing path`);
-        log.error(`Plugin "${plugin.name || 'unknown'}" missing path`);
+      if (!plugin.source) {
+        errors.push(`Plugin "${plugin.name || 'unknown'}" missing source`);
+        log.error(`Plugin "${plugin.name || 'unknown'}" missing source`);
       }
     }
     log.success(`Found ${marketplace.plugins.length} plugin(s) registered`);
@@ -295,7 +295,7 @@ function main() {
   // Validate plugins
   if (!marketplaceOnly && marketplace?.plugins) {
     for (const plugin of marketplace.plugins) {
-      validatePlugin(plugin.path, plugin.name);
+      validatePlugin(plugin.source, plugin.name);
     }
   } else if (!marketplaceOnly && !marketplace) {
     // Still try to validate plugins directory if marketplace.json is invalid
