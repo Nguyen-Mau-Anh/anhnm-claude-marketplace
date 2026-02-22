@@ -1,0 +1,15 @@
+{
+  "name": "test-case-generator",
+  "version": "1.0.0",
+  "description": "Generate comprehensive test cases from requirements, PRDs, user stories, API specs, or existing code",
+  "author": {
+    "name": "anhnm"
+  },
+  "license": "MIT",
+  "keywords": [
+    "testing",
+    "test-cases",
+    "qa",
+    "test-generation"
+  ]
+}
