@@ -36,8 +36,8 @@ jobs:
 
           for plugin in data['plugins']:
               plugin_name = plugin['name']
-              plugin_path = plugin['path']
-              print(f"Validating plugin: {plugin_name} (path: {plugin_path})")
+              plugin_path = plugin['source']
+              print(f"Validating plugin: {plugin_name} (source: {plugin_path})")
 
               # Check plugin.json exists
               plugin_json = f"{plugin_path}/.claude-plugin/plugin.json"
