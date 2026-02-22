@@ -51,13 +51,7 @@ function createPluginJson(pluginPath, config) {
     },
     license: 'MIT',
     keywords: config.keywords || [],
-    components: {},
   };
-
-  if (config.hasCommands) pluginJson.components.commands = [];
-  if (config.hasSkills) pluginJson.components.skills = [];
-  if (config.hasHooks) pluginJson.components.hooks = [];
-  if (config.hasAgents) pluginJson.components.agents = [];
 
   const jsonPath = path.join(pluginPath, '.claude-plugin', 'plugin.json');
   fs.writeFileSync(jsonPath, JSON.stringify(pluginJson, null, 2) + '\n');
@@ -307,7 +301,7 @@ function updateMarketplace(config) {
 
   marketplace.plugins.push({
     name: config.name,
-    path: `plugins/${config.name}`,
+    source: `./plugins/${config.name}`,
     description: config.description,
   });
 

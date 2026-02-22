@@ -11,9 +11,24 @@
   },
   "plugins": [
     {
+      "name": "java-developer",
+      "source": "./plugins/java-developer",
+      "description": "Expert Java development skill covering Spring Boot, Jakarta EE, and plain Java across versions 8 through 21+"
+    },
+    {
+      "name": "test-case-generator",
+      "source": "./plugins/test-case-generator",
+      "description": "Generate comprehensive test cases from requirements, PRDs, user stories, API specs, or existing code"
+    },
+    {
+      "name": "learning-accelerator",
+      "source": "./plugins/learning-accelerator",
+      "description": "Structured learning acceleration framework guiding through goal setting, research, priming, comprehension, and implementation"
+    },
+    {
       "name": "developer-toolkit",
-      "source": "./plugins",
-      "description": "Skills for Java/Spring Boot development, test case generation, and structured learning acceleration"
+      "source": "./plugins/developer-toolkit",
+      "description": "Personal plugin with custom hooks, commands, and agents for Claude Code"
     }
   ]
 }

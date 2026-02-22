@@ -1,0 +1,15 @@
+{
+  "name": "learning-accelerator",
+  "version": "1.0.0",
+  "description": "Structured learning acceleration framework guiding through goal setting, research, priming, comprehension, and implementation",
+  "author": {
+    "name": "anhnm"
+  },
+  "license": "MIT",
+  "keywords": [
+    "learning",
+    "education",
+    "structured-learning",
+    "skill-development"
+  ]
+}

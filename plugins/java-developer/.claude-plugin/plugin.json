@@ -1,0 +1,15 @@
+{
+  "name": "java-developer",
+  "version": "1.0.0",
+  "description": "Expert Java development skill covering Spring Boot, Jakarta EE, and plain Java across versions 8 through 21+",
+  "author": {
+    "name": "anhnm"
+  },
+  "license": "MIT",
+  "keywords": [
+    "java",
+    "spring-boot",
+    "jakarta-ee",
+    "backend"
+  ]
+}
