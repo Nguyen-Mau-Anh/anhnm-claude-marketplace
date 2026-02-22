@@ -11,9 +11,9 @@
   },
   "plugins": [
     {
-      "name": "hello-world",
+      "name": "developer-toolkit",
       "source": "./plugins",
-      "description": "Example plugin demonstrating skills, hooks, commands, and agents"
+      "description": "Skills for Java/Spring Boot development, test case generation, and structured learning acceleration"
     }
   ]
 }

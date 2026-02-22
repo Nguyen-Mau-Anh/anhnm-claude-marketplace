@@ -1,5 +1,5 @@
 {
-  "name": "hello-world",
+  "name": "developer-toolkit",
   "version": "1.0.1",
   "description": "Personal plugin with custom skills, hooks, commands, and agents for Claude Code",
   "author": {
@@ -7,9 +7,10 @@
   },
   "license": "MIT",
   "keywords": [
-    "example",
-    "starter",
-    "template"
+    "java",
+    "testing",
+    "learning",
+    "developer-tools"
   ],
   "components": {
     "commands": [
