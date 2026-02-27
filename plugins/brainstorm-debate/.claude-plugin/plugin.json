@@ -1,0 +1,16 @@
+{
+  "name": "brainstorm-debate",
+  "version": "1.0.0",
+  "description": "7-agent brainstorm debate team to stress-test project ideas from every angle — business, technical, UX, edge cases, and more",
+  "author": {
+    "name": "anhnm"
+  },
+  "license": "MIT",
+  "keywords": [
+    "brainstorm",
+    "debate",
+    "ideation",
+    "team",
+    "multi-agent"
+  ]
+}

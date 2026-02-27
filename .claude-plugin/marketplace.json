@@ -29,6 +29,11 @@
       "name": "developer-toolkit",
       "source": "./plugins/developer-toolkit",
       "description": "Personal plugin with custom hooks, commands, and agents for Claude Code"
+    },
+    {
+      "name": "brainstorm-debate",
+      "source": "./plugins/brainstorm-debate",
+      "description": "7-agent brainstorm debate team to stress-test project ideas from every angle"
     }
   ]
 }
